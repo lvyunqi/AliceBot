@@ -3,6 +3,9 @@
 //! 使用 rusqlite（bundled 模式，编译自带 SQLite）。WAL 模式提升并发。
 //! 每条消息全量入库，定时由后台任务压缩/清理。
 
+mod migrations;
+
+use migrations::DatabaseError;
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -28,272 +31,27 @@ pub struct OutboundAttempt {
 
 impl Database {
     /// 打开/创建数据库
-    pub fn open(path: &str) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
-        let db = Self {
+    pub fn open(path: &str) -> Result<Self, DatabaseError> {
+        let path = Path::new(path);
+        let had_existing_database = migrations::has_existing_database(path);
+        let mut conn = Connection::open(path)?;
+        let report = migrations::prepare_database(path, &mut conn, had_existing_database)?;
+
+        if report.from < report.to {
+            match report.backup_path {
+                Some(backup_path) => log::info!(
+                    "[AliceBot] database migrated v{} -> v{}; backup: {}",
+                    report.from,
+                    report.to,
+                    backup_path.display()
+                ),
+                None => log::info!("[AliceBot] database initialized at schema v{}", report.to),
+            }
+        }
+
+        Ok(Self {
             conn: Mutex::new(conn),
-        };
-        db.init_tables()?;
-        Ok(db)
-    }
-
-    /// 初始化表结构
-    fn init_tables(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-
-        // 消息表
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS messages (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_key     TEXT,
-                action_key    TEXT,
-                protocol      TEXT NOT NULL,
-                bot_account_id TEXT,
-                direction     TEXT NOT NULL,
-                session_type  TEXT NOT NULL,
-                session_id    TEXT NOT NULL,
-                sender_id     TEXT NOT NULL,
-                sender_name   TEXT,
-                message_id    TEXT,
-                content       TEXT NOT NULL,
-                raw_json      TEXT,
-                has_media     INTEGER DEFAULT 0,
-                media_type    TEXT,
-                media_url     TEXT,
-                reply_to_id   TEXT,
-                at_me         INTEGER DEFAULT 0,
-                sentiment     INTEGER,
-                created_at    INTEGER NOT NULL,
-                updated_at    INTEGER NOT NULL
-            );",
-        )?;
-        ensure_column(&conn, "messages", "event_key", "TEXT")?;
-        ensure_column(&conn, "messages", "action_key", "TEXT")?;
-        ensure_column(&conn, "messages", "bot_account_id", "TEXT")?;
-        ensure_column(&conn, "messages", "media_url", "TEXT")?;
-        ensure_column(&conn, "messages", "updated_at", "INTEGER")?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_msg_session_time ON messages(session_id, created_at);",
-        )?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_msg_sender_time ON messages(sender_id, created_at);",
-        )?;
-        conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ux_msg_event_direction
-             ON messages(event_key, direction) WHERE event_key IS NOT NULL;",
-        )?;
-
-        // 出站消息和宿主发送尝试
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS outbound_messages (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                action_key      TEXT NOT NULL,
-                source_event_key TEXT,
-                protocol        TEXT NOT NULL,
-                bot_account_id  TEXT,
-                session_type    TEXT NOT NULL,
-                session_id      TEXT NOT NULL,
-                content         TEXT NOT NULL DEFAULT '',
-                media_type      TEXT,
-                media_url       TEXT,
-                status          TEXT NOT NULL DEFAULT 'pending',
-                host_status     TEXT,
-                error           TEXT,
-                attempt_count   INTEGER NOT NULL DEFAULT 1,
-                created_at      INTEGER NOT NULL,
-                updated_at      INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_outbound_session_time
-                ON outbound_messages(session_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_outbound_status_time
-                ON outbound_messages(status, created_at);",
-        )?;
-
-        // 决策 trace：记录每条消息的可解释评分，支持离线回放和调参。
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS decision_traces (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_key       TEXT NOT NULL UNIQUE,
-                session_id      TEXT NOT NULL,
-                score           REAL NOT NULL,
-                threshold       REAL NOT NULL,
-                direct          INTEGER NOT NULL,
-                outcome         TEXT NOT NULL,
-                reason          TEXT NOT NULL,
-                signals_json    TEXT NOT NULL,
-                created_at      INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_decision_session_time
-                ON decision_traces(session_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_decision_outcome_time
-                ON decision_traces(outcome, created_at);",
-        )?;
-
-        // LLM 调用审计：只记录指标和分类，不保存 prompt/response 原文。
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS llm_calls (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                task         TEXT NOT NULL,
-                provider_id  TEXT NOT NULL,
-                protocol     TEXT NOT NULL,
-                model        TEXT,
-                attempt      INTEGER NOT NULL,
-                status       TEXT NOT NULL DEFAULT 'started',
-                error_kind   TEXT,
-                input_chars  INTEGER NOT NULL DEFAULT 0,
-                output_chars INTEGER NOT NULL DEFAULT 0,
-                latency_ms   INTEGER,
-                created_at   INTEGER NOT NULL,
-                updated_at   INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_llm_calls_task_time
-                ON llm_calls(task, created_at);
-            CREATE INDEX IF NOT EXISTS idx_llm_calls_status_time
-                ON llm_calls(status, created_at);",
-        )?;
-
-        // 可恢复的压缩任务状态。
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS compaction_runs (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_key         TEXT NOT NULL UNIQUE,
-                cursor_start    INTEGER NOT NULL,
-                cursor_end      INTEGER NOT NULL,
-                status          TEXT NOT NULL,
-                processed_count INTEGER NOT NULL DEFAULT 0,
-                error           TEXT,
-                started_at      INTEGER NOT NULL,
-                finished_at     INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_compaction_status_time
-                ON compaction_runs(status, started_at);",
-        )?;
-
-        // 长期记忆
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS long_memory (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id    TEXT,
-                subject_id    TEXT,
-                content       TEXT NOT NULL,
-                kind          TEXT DEFAULT 'fact',
-                importance    INTEGER DEFAULT 50,
-                is_active     INTEGER DEFAULT 1,
-                access_count  INTEGER DEFAULT 0,
-                last_access   INTEGER,
-                created_at    INTEGER NOT NULL,
-                updated_at    INTEGER
-            );",
-        )?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_mem_active_imp ON long_memory(is_active, importance);",
-        )?;
-
-        // 用户画像
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS personas (
-                subject_id        TEXT PRIMARY KEY,
-                protocol          TEXT,
-                nickname          TEXT,
-                first_seen        INTEGER,
-                last_seen         INTEGER,
-                interaction_count INTEGER DEFAULT 0,
-                intimacy          INTEGER DEFAULT 0,
-                relation          TEXT,
-                traits            TEXT,
-                preferences       TEXT,
-                topics            TEXT,
-                notes             TEXT
-            );",
-        )?;
-
-        // 知识库
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS knowledge (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                subject       TEXT,
-                content       TEXT NOT NULL,
-                category      TEXT,
-                source        TEXT,
-                confidence    INTEGER DEFAULT 60,
-                is_active     INTEGER DEFAULT 1,
-                access_count  INTEGER DEFAULT 0,
-                created_at    INTEGER NOT NULL,
-                updated_at    INTEGER
-            );",
-        )?;
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_know_subject ON knowledge(subject, is_active);",
-        )?;
-
-        // 表情包
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS stickers (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                protocol      TEXT,
-                kind          TEXT DEFAULT 'image',
-                media_url     TEXT NOT NULL,
-                file_hash     TEXT,
-                source_user   TEXT,
-                source_session TEXT,
-                usage_count   INTEGER DEFAULT 0,
-                last_used     INTEGER,
-                created_at    INTEGER NOT NULL
-            );",
-        )?;
-
-        // 表情包标签
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sticker_tags (
-                sticker_id    INTEGER NOT NULL,
-                tag           TEXT NOT NULL,
-                weight        INTEGER DEFAULT 1,
-                PRIMARY KEY (sticker_id, tag)
-            );",
-        )?;
-
-        // 表情包关联
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS sticker_links (
-                sticker_a     INTEGER NOT NULL,
-                sticker_b     INTEGER NOT NULL,
-                co_count      INTEGER DEFAULT 1,
-                updated_at    INTEGER,
-                PRIMARY KEY (sticker_a, sticker_b)
-            );",
-        )?;
-
-        // 反思日志
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS reflection_log (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                triggered_by  TEXT,
-                summary       TEXT,
-                insights      TEXT,
-                created_at    INTEGER NOT NULL
-            );",
-        )?;
-
-        // 元数据
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );",
-        )?;
-
-        // 设置 schema 版本
-        conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4')",
-            [],
-        )?;
-        conn.execute(
-            "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
-            [],
-        )?;
-
-        Ok(())
+        })
     }
 
     /// 插入一条消息
@@ -570,34 +328,6 @@ pub async fn init_database(path: &str) -> Result<Database, String> {
         std::fs::create_dir_all(parent).map_err(|e| format!("数据库目录创建失败: {e}"))?;
     }
     Database::open(path).map_err(|e| format!("数据库打开失败: {}", e))
-}
-
-fn ensure_column(
-    conn: &Connection,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> Result<(), rusqlite::Error> {
-    let exists = {
-        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let mut rows = statement.query([])?;
-        let mut found = false;
-        while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
-            if name == column {
-                found = true;
-                break;
-            }
-        }
-        found
-    };
-
-    if !exists {
-        conn.execute_batch(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))?;
-    }
-    Ok(())
 }
 
 fn truncate_for_storage(value: &str) -> String {
