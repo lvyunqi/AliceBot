@@ -1,5 +1,4 @@
-//! LLM 协议抽象与主备客户端。
-
+//! LLM protocol abstraction, provider fallback, and redacted call auditing.
 pub mod anthropic;
 pub mod openai;
 
@@ -7,9 +6,8 @@ pub mod openai;
 pub(crate) mod test_support;
 
 use async_trait::async_trait;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// 聊天消息角色。
 #[derive(Debug, Clone)]
 pub enum Role {
     System,
@@ -99,11 +97,12 @@ pub trait Llm: Send + Sync {
 
 struct ProviderClient {
     id: String,
+    protocol: String,
     model: String,
     client: Box<dyn Llm>,
 }
 
-/// 按 priority 排序的 provider 集合，失败后才切换下一个 provider。
+/// Providers are tried by priority; retryable errors move through the configured fallback chain.
 pub struct LlmClient {
     providers: Vec<ProviderClient>,
     retry_limit: u32,
@@ -123,6 +122,7 @@ impl LlmClient {
                         provider.id.clone(),
                         ProviderClient {
                             id: provider.id.clone(),
+                            protocol: provider.protocol.clone(),
                             model: provider.model.clone(),
                             client: create_client(
                                 &provider.protocol,
@@ -151,7 +151,16 @@ impl LlmClient {
     }
 
     pub async fn chat(&self, request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+        self.chat_with_task("chat", request).await
+    }
+
+    pub async fn chat_with_task(
+        &self,
+        task: &str,
+        request: &ChatRequest,
+    ) -> Result<ChatResponse, LlmError> {
         let mut last_error = None;
+        let input_chars = input_chars(request);
 
         for provider in &self.providers {
             let mut attempt = 0;
@@ -160,16 +169,35 @@ impl LlmClient {
                 if provider_request.model.trim().is_empty() {
                     provider_request.model = provider.model.clone();
                 }
+                let audit_id = begin_audit(
+                    task,
+                    provider,
+                    &provider_request.model,
+                    attempt + 1,
+                    input_chars,
+                );
+                let started = Instant::now();
 
                 match provider.client.chat(&provider_request).await {
-                    Ok(response) if !response.text.trim().is_empty() => return Ok(response),
+                    Ok(response) if !response.text.trim().is_empty() => {
+                        finish_audit(
+                            audit_id,
+                            "success",
+                            None,
+                            response.text.chars().count(),
+                            started,
+                        );
+                        return Ok(response);
+                    }
                     Ok(_) => {
+                        finish_audit(audit_id, "empty", Some(&ErrorKind::Parse), 0, started);
                         last_error = Some(LlmError {
                             kind: ErrorKind::Parse,
-                            message: format!("provider {} 返回空文本", provider.id),
+                            message: format!("provider {} returned empty text", provider.id),
                         });
                     }
                     Err(error) => {
+                        finish_audit(audit_id, "error", Some(&error.kind), 0, started);
                         let retryable = matches!(
                             &error.kind,
                             ErrorKind::Timeout | ErrorKind::RateLimited | ErrorKind::Server
@@ -189,8 +217,72 @@ impl LlmClient {
 
         Err(last_error.unwrap_or(LlmError {
             kind: ErrorKind::NoProvider,
-            message: "没有可用的 LLM provider".to_string(),
+            message: "no usable LLM provider".to_string(),
         }))
+    }
+}
+
+fn input_chars(request: &ChatRequest) -> usize {
+    request
+        .system
+        .as_ref()
+        .map(|text| text.chars().count())
+        .unwrap_or(0)
+        + request
+            .messages
+            .iter()
+            .map(|message| message.content.chars().count())
+            .sum::<usize>()
+}
+
+fn begin_audit(
+    task: &str,
+    provider: &ProviderClient,
+    model: &str,
+    attempt: u32,
+    input_chars: usize,
+) -> Option<i64> {
+    let database = crate::pipeline::try_db()?;
+    match database.begin_llm_call(
+        task,
+        &provider.id,
+        &provider.protocol,
+        model,
+        attempt,
+        input_chars,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        Ok(id) => Some(id),
+        Err(error) => {
+            log::debug!("[AliceBot] LLM audit insert failed: {error}");
+            None
+        }
+    }
+}
+
+fn finish_audit(
+    audit_id: Option<i64>,
+    status: &str,
+    error_kind: Option<&ErrorKind>,
+    output_chars: usize,
+    started: Instant,
+) {
+    let Some(id) = audit_id else {
+        return;
+    };
+    let Some(database) = crate::pipeline::try_db() else {
+        return;
+    };
+    let error_kind = error_kind.map(|kind| format!("{kind:?}"));
+    if let Err(error) = database.finish_llm_call(
+        id,
+        status,
+        error_kind.as_deref(),
+        output_chars,
+        started.elapsed().as_millis() as u64,
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        log::debug!("[AliceBot] LLM audit update failed: {error}");
     }
 }
 
@@ -214,11 +306,68 @@ pub fn create_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn empty_provider_set_is_explicit() {
         let config = crate::config::LlmConfig::default();
         let client = LlmClient::from_config(&config);
         assert_eq!(client.provider_count(), 0);
+    }
+
+    #[test]
+    fn audit_size_counts_characters_without_exposing_content() {
+        let request = ChatRequest {
+            model: "model".to_string(),
+            system: Some("system".to_string()),
+            messages: vec![ChatMessage::user("你好")],
+            temperature: 1.0,
+            max_tokens: 10,
+        };
+        assert_eq!(input_chars(&request), 8);
+    }
+
+    struct RetryMock {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Llm for RetryMock {
+        async fn chat(&self, _req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(LlmError {
+                    kind: ErrorKind::Server,
+                    message: "temporary".to_string(),
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: "ok".to_string(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retryable_provider_error_is_retried_before_success() {
+        let mock = RetryMock {
+            calls: AtomicUsize::new(0),
+        };
+        let client = LlmClient {
+            providers: vec![ProviderClient {
+                id: "mock".to_string(),
+                protocol: "test".to_string(),
+                model: "model".to_string(),
+                client: Box::new(mock),
+            }],
+            retry_limit: 1,
+        };
+        let request = ChatRequest {
+            model: String::new(),
+            system: None,
+            messages: vec![ChatMessage::user("hello")],
+            temperature: 1.0,
+            max_tokens: 10,
+        };
+        assert_eq!(client.chat(&request).await.unwrap().text, "ok");
     }
 }

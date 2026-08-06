@@ -130,6 +130,29 @@ impl Database {
                 ON decision_traces(outcome, created_at);",
         )?;
 
+        // LLM 调用审计：只记录指标和分类，不保存 prompt/response 原文。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS llm_calls (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                task         TEXT NOT NULL,
+                provider_id  TEXT NOT NULL,
+                protocol     TEXT NOT NULL,
+                model        TEXT,
+                attempt      INTEGER NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'started',
+                error_kind   TEXT,
+                input_chars  INTEGER NOT NULL DEFAULT 0,
+                output_chars INTEGER NOT NULL DEFAULT 0,
+                latency_ms   INTEGER,
+                created_at   INTEGER NOT NULL,
+                updated_at   INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_task_time
+                ON llm_calls(task, created_at);
+            CREATE INDEX IF NOT EXISTS idx_llm_calls_status_time
+                ON llm_calls(status, created_at);",
+        )?;
+
         // 可恢复的压缩任务状态。
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS compaction_runs (
@@ -262,11 +285,11 @@ impl Database {
 
         // 设置 schema 版本
         conn.execute(
-            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '3')",
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', '4')",
             [],
         )?;
         conn.execute(
-            "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+            "UPDATE meta SET value = '4' WHERE key = 'schema_version'",
             [],
         )?;
 
@@ -393,6 +416,63 @@ impl Database {
                 reason,
                 truncate_for_storage(signals_json),
                 created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 记录一次 provider 尝试开始；只存可观测指标，不存消息原文。
+    pub fn begin_llm_call(
+        &self,
+        task: &str,
+        provider_id: &str,
+        protocol: &str,
+        model: &str,
+        attempt: u32,
+        input_chars: usize,
+        now: i64,
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO llm_calls
+             (task, provider_id, protocol, model, attempt, input_chars, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                task,
+                provider_id,
+                protocol,
+                model,
+                attempt,
+                input_chars.min(i64::MAX as usize) as i64,
+                now,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 完成一次 provider 尝试，`error_kind` 只允许错误分类而非原始响应。
+    pub fn finish_llm_call(
+        &self,
+        id: i64,
+        status: &str,
+        error_kind: Option<&str>,
+        output_chars: usize,
+        latency_ms: u64,
+        now: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE llm_calls
+             SET status = ?1, error_kind = ?2, output_chars = ?3,
+                 latency_ms = ?4, updated_at = ?5
+             WHERE id = ?6",
+            params![
+                status,
+                error_kind,
+                output_chars.min(i64::MAX as usize) as i64,
+                latency_ms.min(i64::MAX as u64) as i64,
+                now,
+                id,
             ],
         )?;
         Ok(())
@@ -709,6 +789,51 @@ mod tests {
         assert_eq!(row.0, 1);
         assert_eq!(row.1, "reply");
         assert_eq!(row.2, 61.5);
+
+        drop(connection);
+        drop(database);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn llm_audit_stores_metrics_without_prompt_text() {
+        let path = std::env::temp_dir().join(format!(
+            "alicebot-llm-audit-test-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let database = Database::open(path.to_str().expect("temporary path is not UTF-8"))
+            .expect("database should open");
+        let id = database
+            .begin_llm_call("group_reply", "primary", "openai", "mock-model", 1, 123, 10)
+            .expect("llm call should insert");
+        database
+            .finish_llm_call(id, "error", Some("RateLimited"), 0, 42, 52)
+            .expect("llm call should finish");
+
+        let connection = database.conn.lock().expect("database lock should work");
+        let row: (String, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT status, error_kind, input_chars, output_chars, latency_ms
+                 FROM llm_calls WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("llm audit row should exist");
+        assert_eq!(
+            row,
+            ("error".to_string(), "RateLimited".to_string(), 123, 0, 42)
+        );
 
         drop(connection);
         drop(database);
