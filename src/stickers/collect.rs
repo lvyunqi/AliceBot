@@ -88,8 +88,36 @@ pub fn deterministic_sample(value: &str) -> f32 {
 }
 
 fn hash_url(url: &str) -> String {
-    let digest = Sha256::digest(url.as_bytes());
+    let digest = Sha256::digest(canonical_url(url).as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn canonical_url(url: &str) -> String {
+    let Some((base, query)) = url.split_once('?') else {
+        return url.to_string();
+    };
+    let stable_query = query
+        .split('&')
+        .filter(|part| {
+            let key = part
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            !(key.contains("token")
+                || key.contains("secret")
+                || key.contains("rkey")
+                || key.contains("signature")
+                || key == "sig"
+                || key == "auth"
+                || key.ends_with("_key"))
+        })
+        .collect::<Vec<_>>();
+    if stable_query.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}?{}", stable_query.join("&"))
+    }
 }
 
 fn tags_from_context(context: &str) -> Vec<String> {
@@ -122,5 +150,9 @@ mod tests {
     fn invalid_media_is_not_collected() {
         assert_eq!(hash_url("http://example.test/a.png").len(), 64);
         assert!(tags_from_context("今天哈哈开心").contains(&"哈哈".to_string()));
+        assert_eq!(
+            hash_url("https://example.test/a.png?fileid=1&rkey=old"),
+            hash_url("https://example.test/a.png?fileid=1&rkey=new")
+        );
     }
 }
