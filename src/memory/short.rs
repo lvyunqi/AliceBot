@@ -23,7 +23,6 @@ struct SessionContext {
 static SHORT_CONTEXTS: Mutex<VecDeque<SessionContext>> = Mutex::new(VecDeque::new());
 
 const MAX_SESSIONS: usize = 100;
-const DEFAULT_MAX_MESSAGES: usize = 30;
 const MIN_MAX_MESSAGES: usize = 5;
 const MAX_MAX_MESSAGES: usize = 200;
 

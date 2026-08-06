@@ -90,7 +90,7 @@ impl PluginRuntime {
     }
 
     /// 启动后台任务（压缩、反思等）。
-    pub fn start_background_tasks(&self, _config: AppConfig) -> Result<(), String> {
+    pub fn start_background_tasks(&self, config: AppConfig) -> Result<(), String> {
         self.start()?;
 
         let mut state = self
@@ -102,6 +102,13 @@ impl PluginRuntime {
         };
         let shutdown = state.shutdown.clone();
         let stop_notify = state.stop_notify.clone();
+        let interval = Duration::from_secs(
+            config
+                .memories
+                .compress_interval_hours
+                .clamp(1, 168)
+                .saturating_mul(3_600),
+        );
 
         let task = runtime.handle().spawn(async move {
             log::info!("[AliceBot] 后台任务已启动");
@@ -109,8 +116,11 @@ impl PluginRuntime {
                 if shutdown.load(Ordering::Acquire) {
                     break;
                 }
+                if let Err(error) = crate::memory::compact::run_if_due(&config).await {
+                    log::warn!("[AliceBot] scheduled compaction failed: {error}");
+                }
                 tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+                    _ = tokio::time::sleep(interval) => {}
                     _ = stop_notify.notified() => break,
                 }
             }

@@ -130,6 +130,23 @@ impl Database {
                 ON decision_traces(outcome, created_at);",
         )?;
 
+        // 可恢复的压缩任务状态。
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS compaction_runs (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_key         TEXT NOT NULL UNIQUE,
+                cursor_start    INTEGER NOT NULL,
+                cursor_end      INTEGER NOT NULL,
+                status          TEXT NOT NULL,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                error           TEXT,
+                started_at      INTEGER NOT NULL,
+                finished_at     INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_compaction_status_time
+                ON compaction_runs(status, started_at);",
+        )?;
+
         // 长期记忆
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS long_memory (
@@ -381,6 +398,47 @@ impl Database {
         Ok(())
     }
 
+    pub fn begin_compaction_run(
+        &self,
+        run_key: &str,
+        cursor_start: i64,
+        cursor_end: i64,
+        started_at: i64,
+    ) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO compaction_runs
+             (run_key, cursor_start, cursor_end, status, started_at)
+             VALUES (?1, ?2, ?3, 'running', ?4)",
+            params![run_key, cursor_start, cursor_end, started_at],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn finish_compaction_run(
+        &self,
+        run_key: &str,
+        status: &str,
+        processed_count: i64,
+        error: Option<&str>,
+        finished_at: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE compaction_runs
+             SET status = ?1, processed_count = ?2, error = ?3, finished_at = ?4
+             WHERE run_key = ?5",
+            params![
+                status,
+                processed_count,
+                error.map(truncate_for_storage),
+                finished_at,
+                run_key
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 更新或插入用户画像
     pub fn upsert_persona(&self, persona: &crate::memory::Persona) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
@@ -423,16 +481,6 @@ impl Database {
             Some(row) => Ok(Some(row.get::<_, String>(0)?)),
             None => Ok(None),
         }
-    }
-
-    /// 设置元数据
-    pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
-            params![key, value],
-        )?;
-        Ok(())
     }
 }
 

@@ -10,6 +10,8 @@ use crate::db::OutboundAttempt;
 static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 保留旧的文本发送入口，适合没有入站事件关联的主动发送。
+#[allow(dead_code)]
+#[allow(dead_code)]
 pub async fn send_text(account_id: &str, session_id: &str, session_type: &str, text: &str) -> bool {
     send_text_for_event(account_id, "unknown", session_id, session_type, text, None).await
 }
@@ -90,6 +92,7 @@ pub async fn send_text_for_event(
 }
 
 /// 发送 URL 图片，具体协议转换交给宿主。
+#[allow(dead_code)]
 pub async fn send_image_url(
     account_id: &str,
     session_id: &str,
@@ -263,6 +266,7 @@ fn escape_json(value: &str) -> String {
 }
 
 /// Base64 发送保留给宿主能力明确的出站场景，当前入站 URL 链路不调用它。
+#[allow(dead_code)]
 pub async fn send_image_base64(
     _account_id: &str,
     _session_id: &str,
