@@ -1,0 +1,10 @@
+target/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+config/
+data/
+.env
+*.toml
+!Cargo.toml

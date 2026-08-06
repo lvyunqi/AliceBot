@@ -1,0 +1,207 @@
+//! 短期记忆：按会话保存最近的用户与机器人消息。
+//!
+//! 这里使用进程内 LRU，消息原文仍然由 `messages` 表持久化。短期记忆只负责
+//! 为下一次 LLM 请求提供低延迟上下文，不把数据库锁带进模型请求。
+use std::collections::VecDeque;
+use std::sync::Mutex;
+
+use crate::pipeline::InMessage;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextMessage {
+    pub role: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub is_key: bool,
+}
+
+struct SessionContext {
+    session_id: String,
+    messages: VecDeque<ContextMessage>,
+}
+
+static SHORT_CONTEXTS: Mutex<VecDeque<SessionContext>> = Mutex::new(VecDeque::new());
+
+const MAX_SESSIONS: usize = 100;
+const DEFAULT_MAX_MESSAGES: usize = 30;
+const MIN_MAX_MESSAGES: usize = 5;
+const MAX_MAX_MESSAGES: usize = 200;
+
+/// 推入用户消息。
+pub async fn push(msg: &InMessage) {
+    push_message(
+        &msg.session_id,
+        ContextMessage {
+            role: "user".to_string(),
+            content: context_content(&msg.content, &msg.media, msg.has_media),
+            timestamp: msg.timestamp,
+            is_key: false,
+        },
+    );
+}
+
+/// 推入已经成功发送的机器人消息。
+pub async fn push_assistant(session_id: &str, content: &str, timestamp: i64) {
+    if content.trim().is_empty() {
+        return;
+    }
+    push_message(
+        session_id,
+        ContextMessage {
+            role: "assistant".to_string(),
+            content: content.trim().to_string(),
+            timestamp,
+            is_key: false,
+        },
+    );
+}
+
+fn push_message(session_id: &str, message: ContextMessage) {
+    let limit = crate::pipeline::current_config()
+        .memories
+        .short_size
+        .clamp(MIN_MAX_MESSAGES, MAX_MAX_MESSAGES);
+    let Ok(mut contexts) = SHORT_CONTEXTS.lock() else {
+        return;
+    };
+
+    if let Some(position) = contexts
+        .iter()
+        .position(|item| item.session_id == session_id)
+    {
+        let mut session = contexts
+            .remove(position)
+            .expect("position from VecDeque must remain valid");
+        session.messages.push_back(message);
+        while session.messages.len() > limit {
+            session.messages.pop_front();
+        }
+        contexts.push_back(session);
+    } else {
+        let mut messages = VecDeque::new();
+        messages.push_back(message);
+        contexts.push_back(SessionContext {
+            session_id: session_id.to_string(),
+            messages,
+        });
+        while contexts.len() > MAX_SESSIONS {
+            contexts.pop_front();
+        }
+    }
+}
+
+/// 获取按时间正序排列的上下文，并限制近似 token 数。
+///
+/// 近似算法按 Unicode 字符计数，ASCII 文本每 4 个字符约 1 token，中文等
+/// 非 ASCII 字符按 1 个字符约 1 token 估算。它不依赖具体模型 tokenizer，
+/// 但能稳定地防止上下文无限增长。
+pub fn get_context(session_id: &str, max_tokens: u32) -> Vec<ContextMessage> {
+    let configured_limit = crate::pipeline::current_config()
+        .memories
+        .short_size
+        .clamp(MIN_MAX_MESSAGES, MAX_MAX_MESSAGES);
+    let max_messages = configured_limit.max(1);
+    let max_tokens = max_tokens.max(1) as usize;
+    let Ok(contexts) = SHORT_CONTEXTS.lock() else {
+        return Vec::new();
+    };
+    let Some(session) = contexts.iter().find(|item| item.session_id == session_id) else {
+        return Vec::new();
+    };
+
+    let mut selected = VecDeque::new();
+    let mut used_tokens = 0;
+    for message in session.messages.iter().rev().take(max_messages) {
+        let message_tokens = estimate_tokens(&message.content).max(1);
+        if !selected.is_empty() && used_tokens + message_tokens > max_tokens {
+            break;
+        }
+        selected.push_front(message.clone());
+        used_tokens += message_tokens;
+        if used_tokens >= max_tokens {
+            break;
+        }
+    }
+    selected.into_iter().collect()
+}
+
+pub fn estimate_tokens(text: &str) -> usize {
+    let ascii = text
+        .chars()
+        .filter(|character| character.is_ascii())
+        .count();
+    let non_ascii = text.chars().count().saturating_sub(ascii);
+    ((ascii + 3) / 4) + non_ascii
+}
+
+fn context_content(content: &str, media: &[crate::pipeline::MediaRef], has_media: bool) -> String {
+    if !content.trim().is_empty() {
+        return content.trim().to_string();
+    }
+    if has_media && !media.is_empty() {
+        return format!("[收到{}个媒体附件]", media.len());
+    }
+    if has_media {
+        return "[收到媒体附件]".to_string();
+    }
+    String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(session_id: &str, content: &str, timestamp: i64) -> InMessage {
+        InMessage {
+            event_key: format!("test:{session_id}:{timestamp}"),
+            protocol: "onebot11".to_string(),
+            bot_account_id: String::new(),
+            session_type: "group".to_string(),
+            session_id: session_id.to_string(),
+            sender_id: "user-1".to_string(),
+            sender_name: "user".to_string(),
+            message_id: timestamp.to_string(),
+            reply_to_id: String::new(),
+            content: content.to_string(),
+            media: Vec::new(),
+            has_media: false,
+            at_me: false,
+            timestamp,
+            safe_raw_json: "{}".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn context_is_chronological_and_contains_assistant_messages() {
+        let session = format!("short-test-{}", std::process::id());
+        push(&message(&session, "first", 1)).await;
+        push_assistant(&session, "reply", 2).await;
+        push(&message(&session, "second", 3)).await;
+
+        let context = get_context(&session, 100);
+        assert_eq!(
+            context
+                .iter()
+                .map(|item| item.role.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "user"]
+        );
+        assert_eq!(context[0].content, "first");
+        assert_eq!(context[1].content, "reply");
+        assert_eq!(context[2].content, "second");
+    }
+
+    #[tokio::test]
+    async fn context_budget_keeps_latest_message() {
+        let session = format!("budget-test-{}", std::process::id());
+        push(&message(&session, "old message", 1)).await;
+        push(&message(&session, "latest", 2)).await;
+
+        let context = get_context(&session, 2);
+        assert_eq!(
+            context.last().map(|item| item.content.as_str()),
+            Some("latest")
+        );
+        assert!(context.len() <= 2);
+    }
+}

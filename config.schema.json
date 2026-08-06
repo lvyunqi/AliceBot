@@ -1,0 +1,317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "AliceBot 配置",
+  "description": "AliceBot 拟人机器人插件配置",
+  "properties": {
+    "persona": {
+      "type": "object",
+      "title": "人物立绘",
+      "description": "AI 的人设信息",
+      "properties": {
+        "name": {
+          "type": "string",
+          "title": "名称",
+          "description": "AI 的名字，群聊中以此名称出现",
+          "minLength": 1,
+          "maxLength": 20,
+          "default": "小艾"
+        },
+        "gender": {
+          "type": "string",
+          "title": "性别",
+          "enum": ["女", "男", "中性", "神秘"],
+          "default": "女"
+        },
+        "age": {
+          "type": "integer",
+          "title": "年龄",
+          "minimum": 1,
+          "maximum": 99,
+          "default": 22
+        },
+        "personality": {
+          "type": "string",
+          "title": "性格",
+          "description": "性格描述，如：俏皮、有点毒舌、好奇心强",
+          "default": "俏皮、有点毒舌、好奇心强"
+        },
+        "background": {
+          "type": "string",
+          "title": "背景故事",
+          "description": "AI 的背景设定",
+          "default": "一个喜欢猫和咖啡的二次元少女，喜欢吐槽但心地善良"
+        },
+        "speaking_style": {
+          "type": "string",
+          "title": "说话风格",
+          "description": "口语化风格描述",
+          "default": "口语化，爱用表情词，偶尔打错字，讨厌一本正经"
+        }
+      },
+      "required": ["name"]
+    },
+    "llm": {
+      "type": "object",
+      "title": "LLM 提供商",
+      "description": "大模型接入配置，支持多个 provider 主备切换",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "启用 LLM",
+          "description": "关闭后仍记录消息，但不调用模型",
+          "default": true
+        },
+        "request_timeout_ms": {
+          "type": "integer",
+          "title": "请求超时(毫秒)",
+          "description": "单次模型请求的最大等待时间",
+          "minimum": 1000,
+          "maximum": 120000,
+          "default": 30000
+        },
+        "retry_limit": {
+          "type": "integer",
+          "title": "重试次数",
+          "description": "超时、限流或服务端错误的最大重试次数",
+          "minimum": 0,
+          "maximum": 3,
+          "default": 1
+        },
+        "providers": {
+          "type": "array",
+          "title": "模型列表",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string",
+                "title": "识别 ID",
+                "description": "唯一标识，用于日志和错误报告",
+                "minLength": 1
+              },
+              "protocol": {
+                "type": "string",
+                "title": "协议",
+                "description": "LLM 协议类型",
+                "enum": ["openai", "anthropic"],
+                "default": "openai"
+              },
+              "base_url": {
+                "type": "string",
+                "title": "接口地址",
+                "description": "API 端点，如 https://api.openai.com/v1",
+                "format": "uri",
+                "default": "https://api.openai.com/v1"
+              },
+              "api_key": {
+                "type": "string",
+                "title": "API 密钥",
+                "description": "API 密钥，不会回传明文",
+                "writeOnly": true,
+                "x-qimen-secret": true,
+                "minLength": 1
+              },
+              "model": {
+                "type": "string",
+                "title": "模型名",
+                "description": "模型名称，如 gpt-4o-mini, claude-sonnet-4-5",
+                "default": "gpt-4o-mini"
+              },
+              "enabled": {
+                "type": "boolean",
+                "title": "启用",
+                "default": true
+              },
+              "priority": {
+                "type": "integer",
+                "title": "优先级",
+                "description": "主备切换顺序，1 为主，失败后依次降级",
+                "minimum": 1,
+                "default": 1
+              }
+            },
+            "required": ["id", "protocol", "base_url", "api_key", "model"]
+          }
+        }
+      }
+    },
+    "behavior": {
+      "type": "object",
+      "title": "拟人行为",
+      "description": "控制 AI 的行为参数",
+      "properties": {
+        "reply_bias": {
+          "type": "number",
+          "title": "回复倾向",
+          "description": "全局回复概率 0-1，越高越爱说话",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.5
+        },
+        "temperature": {
+          "type": "number",
+          "title": "创造性",
+          "description": "回复的随机性/创造性 0-2",
+          "minimum": 0,
+          "maximum": 2,
+          "default": 1.0
+        },
+        "max_tokens": {
+          "type": "integer",
+          "title": "最大回复长度",
+          "description": "单次回复最大 token 数",
+          "minimum": 64,
+          "maximum": 4096,
+          "default": 512
+        },
+        "max_context_tokens": {
+          "type": "integer",
+          "title": "上下文上限",
+          "description": "组装上下文的最大 token 数",
+          "minimum": 1024,
+          "maximum": 32000,
+          "default": 4000
+        },
+        "min_interval_sec": {
+          "type": "integer",
+          "title": "最小回复间隔(秒)",
+          "description": "同会话内两条主动回复的最小间隔",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 15
+        },
+        "allow_typos": {
+          "type": "boolean",
+          "title": "允许语句错误",
+          "description": "允许回复中偶尔出现口语化错误，更拟人",
+          "default": true
+        },
+        "emoji_usage": {
+          "type": "number",
+          "title": "Emoji 使用概率",
+          "description": "回复中带 emoji 的概率 0-1",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.6
+        }
+      }
+    },
+    "memories": {
+      "type": "object",
+      "title": "记忆策略",
+      "description": "短期/长期记忆策略参数",
+      "properties": {
+        "short_size": {
+          "type": "integer",
+          "title": "短期记忆条数",
+          "description": "每个会话保留的最近消息数",
+          "minimum": 5,
+          "maximum": 200,
+          "default": 30
+        },
+        "long_topk": {
+          "type": "integer",
+          "title": "长期记忆检索数",
+          "description": "每次注入上下文的长期记忆条数",
+          "minimum": 0,
+          "maximum": 50,
+          "default": 10
+        },
+        "compress_interval_hours": {
+          "type": "integer",
+          "title": "压缩间隔(小时)",
+          "description": "记忆压缩和反思的间隔时间",
+          "minimum": 1,
+          "maximum": 168,
+          "default": 6
+        },
+        "compress_min_messages": {
+          "type": "integer",
+          "title": "压缩触发消息数",
+          "description": "达到此消息数触发压缩",
+          "minimum": 50,
+          "maximum": 10000,
+          "default": 200
+        },
+        "importance_threshold": {
+          "type": "integer",
+          "title": "记忆归档阈值",
+          "description": "重要性低于此值可归档(0-100)",
+          "minimum": 0,
+          "maximum": 100,
+          "default": 30
+        },
+        "knowledge_enabled": {
+          "type": "boolean",
+          "title": "启用知识库",
+          "description": "是否从聊天中提取知识",
+          "default": true
+        }
+      }
+    },
+    "stickers": {
+      "type": "object",
+      "title": "表情包策略",
+      "description": "表情包发送、收藏和联想参数",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "启用表情包",
+          "default": true
+        },
+        "auto_collect": {
+          "type": "boolean",
+          "title": "自动收藏",
+          "description": "遇到合适图片时自动收藏为表情包",
+          "default": true
+        },
+        "collect_probability": {
+          "type": "number",
+          "title": "收藏概率",
+          "description": "见图时触发收藏的概率 0-1",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.3
+        },
+        "send_probability": {
+          "type": "number",
+          "title": "发送概率",
+          "description": "回复时带表情包的概率 0-1",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.4
+        },
+        "link_enabled": {
+          "type": "boolean",
+          "title": "联想串联",
+          "description": "是否启用表情包联想串联",
+          "default": true
+        },
+        "max_chain": {
+          "type": "integer",
+          "title": "最大串联数",
+          "description": "一次最多连续发送几张表情包",
+          "minimum": 1,
+          "maximum": 10,
+          "default": 3
+        }
+      }
+    },
+    "send": {
+      "type": "object",
+      "title": "发送",
+      "description": "后台主动发送使用的稳定 Bot 账号选择器",
+      "properties": {
+        "account_id": {
+          "type": "string",
+          "title": "Bot 账号 ID",
+          "description": "对应宿主 bots.account_id；OneBot 通常是 self_id，官方 QQ 使用宿主配置的稳定账号标识",
+          "maxLength": 128,
+          "default": ""
+        }
+      }
+    }
+  },
+  "required": ["persona", "llm"]
+}

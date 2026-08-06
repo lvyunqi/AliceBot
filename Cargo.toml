@@ -1,0 +1,53 @@
+[package]
+name = "alicebot"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "AliceBot - 最强学习力拟人QQ机器人，QimenBot动态插件"
+authors = ["AliceBot Contributors"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# QimenBot 动态插件 ABI
+abi-stable-host-api = "0.1.13"
+qimen-dynamic-plugin-derive = "0.1.13"
+abi_stable = "0.11"
+
+# 异步运行时（插件自建）
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "parking_lot"] }
+
+# 数据库
+rusqlite = { version = "0.34", features = ["bundled"] }
+
+# HTTP 客户端（LLM API 调用）
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 时间
+chrono = "0.4"
+
+# 日志
+log = "0.4"
+
+# 加密/哈希（表情包去重用）
+sha2 = "0.10"
+
+# 环境变量
+dotenvy = "0.15"
+
+# 错误处理
+thiserror = "2"
+
+# 异步 trait（LLM 抽象）
+async-trait = "0.1"
+
+[profile.release]
+opt-level = "z"     # 优化体积
+lto = true
+codegen-units = 1
+strip = true

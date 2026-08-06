@@ -1,0 +1,106 @@
+{
+  "type": "object",
+  "fields": {
+    "persona": {
+      "ui:order": ["name", "gender", "age", "personality", "background", "speaking_style"],
+      "name": {
+        "ui:placeholder": "输入 AI 名字"
+      },
+      "personality": {
+        "ui:widget": "textarea",
+        "ui:placeholder": "如：俏皮、有点毒舌、好奇心强"
+      },
+      "background": {
+        "ui:widget": "textarea",
+        "ui:placeholder": "描述背景故事"
+      },
+      "speaking_style": {
+        "ui:widget": "textarea",
+        "ui:placeholder": "如：口语化，爱用表情词"
+      }
+    },
+    "llm": {
+      "ui:order": ["enabled", "request_timeout_ms", "retry_limit", "providers"],
+      "request_timeout_ms": {
+        "unit": "毫秒"
+      },
+      "retry_limit": {
+        "unit": "次"
+      },
+      "providers": {
+        "items": {
+          "ui:order": ["id", "protocol", "base_url", "model", "api_key", "priority", "enabled"],
+          "api_key": {
+            "ui:widget": "password",
+            "ui:placeholder": "输入 API Key（不回显）"
+          },
+          "base_url": {
+            "ui:placeholder": "https://api.openai.com/v1"
+          },
+          "model": {
+            "ui:placeholder": "gpt-4o-mini"
+          }
+        }
+      }
+    },
+    "behavior": {
+      "ui:order": ["reply_bias", "temperature", "max_tokens", "max_context_tokens", "min_interval_sec", "allow_typos", "emoji_usage"],
+      "reply_bias": {
+        "ui:widget": "slider",
+        "unit": ""
+      },
+      "temperature": {
+        "ui:widget": "slider",
+        "unit": ""
+      },
+      "emoji_usage": {
+        "ui:widget": "slider",
+        "unit": ""
+      },
+      "max_tokens": {
+        "unit": "tokens"
+      },
+      "max_context_tokens": {
+        "unit": "tokens"
+      },
+      "min_interval_sec": {
+        "unit": "秒"
+      }
+    },
+    "memories": {
+      "ui:order": ["short_size", "long_topk", "compress_interval_hours", "compress_min_messages", "importance_threshold", "knowledge_enabled"],
+      "short_size": {
+        "unit": "条"
+      },
+      "long_topk": {
+        "unit": "条"
+      },
+      "compress_interval_hours": {
+        "unit": "小时"
+      },
+      "compress_min_messages": {
+        "unit": "条"
+      }
+    },
+    "stickers": {
+      "ui:order": ["enabled", "auto_collect", "collect_probability", "send_probability", "link_enabled", "max_chain"],
+      "collect_probability": {
+        "ui:widget": "slider",
+        "unit": ""
+      },
+      "send_probability": {
+        "ui:widget": "slider",
+        "unit": ""
+      },
+      "max_chain": {
+        "unit": "张"
+      }
+    },
+    "send": {
+      "ui:order": ["account_id"],
+      "account_id": {
+        "ui:placeholder": "填写宿主 bots.account_id"
+      }
+    }
+  }
+}
