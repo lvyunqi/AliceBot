@@ -13,6 +13,7 @@ use std::sync::Mutex;
 /// 数据库连接（单连接，写操作串行化）
 pub struct Database {
     pub conn: Mutex<Connection>,
+    pub(crate) memory_search: crate::memory::search::SearchBackend,
 }
 
 /// 一次出站发送尝试的审计输入。只保存必要的路由和内容摘要，不保存凭据。
@@ -54,6 +55,15 @@ impl Database {
         let had_existing_database = migrations::has_existing_database(path);
         let mut conn = Connection::open(path)?;
         let report = migrations::prepare_database(path, &mut conn, had_existing_database)?;
+        let memory_search = match crate::memory::search::initialize(&mut conn) {
+            Ok(backend) => backend,
+            Err(error) => {
+                log::warn!(
+                    "[AliceBot] FTS5 memory search initialization failed; using lexical fallback: {error}"
+                );
+                crate::memory::search::SearchBackend::Lexical
+            }
+        };
 
         if report.from < report.to {
             match report.backup_path {
@@ -69,6 +79,7 @@ impl Database {
 
         Ok(Self {
             conn: Mutex::new(conn),
+            memory_search,
         })
     }
 

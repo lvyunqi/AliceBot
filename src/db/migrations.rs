@@ -2,7 +2,8 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 7;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 8;
+pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DatabaseError {
@@ -122,6 +123,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         }
         6 => migration_6_session_state(transaction)?,
         7 => migration_7_structured_memory(transaction)?,
+        8 => migration_8_memory_retrieval(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -491,6 +493,38 @@ fn migration_7_structured_memory(conn: &Connection) -> Result<(), rusqlite::Erro
     Ok(())
 }
 
+fn migration_8_memory_retrieval(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        UPDATE long_memory
+        SET scope = CASE
+            WHEN session_id IS NOT NULL AND subject_id IS NOT NULL THEN 'user_session'
+            WHEN session_id IS NOT NULL THEN 'session'
+            WHEN subject_id IS NOT NULL THEN 'user'
+            ELSE 'global'
+        END
+        WHERE normalized_key LIKE 'legacy:memory:%';
+
+        CREATE INDEX IF NOT EXISTS idx_memory_retrieve_v8
+            ON long_memory(
+                status,
+                is_active,
+                privacy,
+                scope,
+                session_id,
+                subject_id,
+                importance DESC,
+                updated_at DESC
+            );
+
+        INSERT INTO meta (key, value)
+        VALUES ('memory_search_cache_contract', 'fts5-external-content-v1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value;
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -631,6 +665,7 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "ux_session_state_route",
         "ux_memory_key_version",
         "idx_memory_sources_source",
+        "idx_memory_retrieve_v8",
         "ux_knowledge_key_version",
     ];
     for index in required_indexes {
@@ -639,6 +674,19 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "required index {index} is missing"
             )));
         }
+    }
+
+    let search_contract = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'memory_search_cache_contract'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if search_contract.as_deref() != Some(MEMORY_SEARCH_CACHE_CONTRACT) {
+        return Err(DatabaseError::SchemaValidation(
+            "memory search cache contract is missing or unsupported".to_string(),
+        ));
     }
     Ok(())
 }
@@ -915,6 +963,57 @@ mod tests {
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(read_schema_version(&backup).unwrap(), 6);
         assert!(!object_exists(&backup, "table", "memory_sources").unwrap());
+    }
+
+    #[test]
+    fn version_seven_database_gains_memory_retrieval_contract_and_index() {
+        let temporary = TempDatabase::new("version-seven");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 7).unwrap();
+        connection
+            .execute(
+                "INSERT INTO long_memory
+                 (normalized_key, scope, session_id, content, kind, importance,
+                  confidence, privacy, status, version, is_active, created_at, updated_at)
+                 VALUES ('legacy:memory:search', 'session', 'group-1',
+                         'searchable legacy memory', 'fact', 60, 80, 'normal',
+                         'active', 1, 1, 10, 10)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version seven should migrate");
+        assert_eq!(
+            database.get_meta("schema_version").unwrap(),
+            Some(LATEST_SCHEMA_VERSION.to_string())
+        );
+        assert_eq!(
+            database
+                .get_meta("memory_search_cache_contract")
+                .unwrap()
+                .as_deref(),
+            Some(MEMORY_SEARCH_CACHE_CONTRACT)
+        );
+        let connection = database.conn.lock().unwrap();
+        assert!(object_exists(&connection, "index", "idx_memory_retrieve_v8").unwrap());
+        let scope: String = connection
+            .query_row(
+                "SELECT scope FROM long_memory WHERE normalized_key = 'legacy:memory:search'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scope, "session");
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 7);
+        assert!(!object_exists(&backup, "index", "idx_memory_retrieve_v8").unwrap());
+        assert!(!object_exists(&backup, "table", "memory_fts").unwrap());
     }
 
     #[test]

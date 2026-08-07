@@ -7,6 +7,7 @@ mod candidates;
 pub mod compact;
 pub mod long;
 pub mod persona;
+pub(crate) mod search;
 pub mod short;
 
 pub use persona::*;
