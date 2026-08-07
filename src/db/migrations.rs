@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 12;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 13;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +128,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         10 => migration_10_delivery_idempotency(transaction)?,
         11 => migration_11_memory_route_isolation(transaction)?,
         12 => migration_12_short_context_recovery_indexes(transaction)?,
+        13 => migration_13_behavior_calibration(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -827,6 +828,45 @@ fn migration_12_short_context_recovery_indexes(conn: &Connection) -> Result<(), 
     Ok(())
 }
 
+fn migration_13_behavior_calibration(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS behavior_calibration (
+            id                INTEGER PRIMARY KEY CHECK (id = 1),
+            reply_bias_offset REAL NOT NULL DEFAULT 0,
+            reflection_cursor INTEGER NOT NULL DEFAULT 0,
+            updated_at        INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT OR IGNORE INTO behavior_calibration
+            (id, reply_bias_offset, reflection_cursor, updated_at)
+            VALUES (1, 0, 0, 0);
+
+        CREATE TABLE IF NOT EXISTS reflection_changes (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            reflection_id         INTEGER NOT NULL REFERENCES reflection_log(id) ON DELETE CASCADE,
+            cursor_start          INTEGER NOT NULL,
+            cursor_end            INTEGER NOT NULL,
+            old_reply_bias_offset REAL NOT NULL,
+            new_reply_bias_offset REAL NOT NULL,
+            observed_reply_rate   REAL,
+            target_reply_rate     REAL,
+            accepted_reply_count  INTEGER NOT NULL DEFAULT 0,
+            skip_count            INTEGER NOT NULL DEFAULT 0,
+            unreliable_reply_count INTEGER NOT NULL DEFAULT 0,
+            reason                TEXT NOT NULL,
+            status                TEXT NOT NULL,
+            created_at            INTEGER NOT NULL,
+            rolled_back_at        INTEGER
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_reflection_v13
+            ON decision_traces(direct, outcome, id);
+        CREATE INDEX IF NOT EXISTS idx_reflection_changes_status_time_v13
+            ON reflection_changes(status, created_at DESC, id DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -987,6 +1027,20 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
             "reflection_log",
             &["triggered_by", "insights", "created_at"][..],
         ),
+        (
+            "behavior_calibration",
+            &["reply_bias_offset", "reflection_cursor", "updated_at"][..],
+        ),
+        (
+            "reflection_changes",
+            &[
+                "reflection_id",
+                "old_reply_bias_offset",
+                "new_reply_bias_offset",
+                "status",
+                "rolled_back_at",
+            ][..],
+        ),
         ("meta", &["key", "value"][..]),
     ];
 
@@ -1022,6 +1076,8 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_messages_recovery_route_v12",
         "idx_outbound_recovery_recent_v12",
         "idx_outbound_recovery_route_v12",
+        "idx_decision_reflection_v13",
+        "idx_reflection_changes_status_time_v13",
         "ux_knowledge_key_version",
         "idx_persona_subject_protocol",
         "idx_persona_observation_subject",
@@ -1620,6 +1676,46 @@ mod tests {
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(read_schema_version(&backup).unwrap(), 11);
         assert!(!object_exists(&backup, "index", "idx_messages_recovery_recent_v12").unwrap());
+    }
+
+    #[test]
+    fn version_twelve_database_gains_behavior_calibration_tables() {
+        let temporary = TempDatabase::new("version-twelve");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 12).unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version twelve should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(object_exists(&connection, "table", "behavior_calibration").unwrap());
+        assert!(object_exists(&connection, "table", "reflection_changes").unwrap());
+        assert!(object_exists(&connection, "index", "idx_decision_reflection_v13").unwrap());
+        assert!(
+            object_exists(
+                &connection,
+                "index",
+                "idx_reflection_changes_status_time_v13"
+            )
+            .unwrap()
+        );
+        let calibration: (f64, i64) = connection
+            .query_row(
+                "SELECT reply_bias_offset, reflection_cursor
+                 FROM behavior_calibration WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(calibration, (0.0, 0));
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 12);
+        assert!(!object_exists(&backup, "table", "behavior_calibration").unwrap());
+        assert!(!object_exists(&backup, "index", "idx_decision_reflection_v13").unwrap());
     }
 
     #[test]

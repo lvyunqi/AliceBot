@@ -111,13 +111,25 @@ impl PluginRuntime {
         };
         let shutdown = state.shutdown.clone();
         let stop_notify = state.stop_notify.clone();
-        let interval = Duration::from_secs(
+        let compaction_interval = Duration::from_secs(
             config
                 .memories
                 .compress_interval_hours
                 .clamp(1, 168)
                 .saturating_mul(3_600),
         );
+        let reflection_interval = Duration::from_secs(
+            config
+                .memories
+                .reflection_interval_hours
+                .clamp(1, 168)
+                .saturating_mul(3_600),
+        );
+        let interval = if config.memories.reflection_enabled {
+            compaction_interval.min(reflection_interval)
+        } else {
+            compaction_interval
+        };
 
         let task = runtime.handle().spawn(async move {
             log::info!("[AliceBot] 后台任务已启动");
@@ -125,8 +137,32 @@ impl PluginRuntime {
                 if shutdown.load(Ordering::Acquire) {
                     break;
                 }
-                if let Err(error) = crate::memory::compact::run_if_due(&config).await {
-                    log::warn!("[AliceBot] scheduled compaction failed: {error}");
+                let compaction_succeeded = match crate::memory::compact::run_if_due(&config).await {
+                    Ok(_) => true,
+                    Err(error) => {
+                        log::warn!("[AliceBot] scheduled compaction failed: {error}");
+                        false
+                    }
+                };
+                if compaction_succeeded {
+                    match crate::memory::reflection::run_if_due(&config).await {
+                        Ok(report) => {
+                            if matches!(
+                                report.action,
+                                crate::memory::reflection::ReflectionAction::Applied
+                                    | crate::memory::reflection::ReflectionAction::RolledBack
+                            ) {
+                                log::info!(
+                                    "[AliceBot] behavior calibration completed: action={:?}, samples={}, cursor={}..{}",
+                                    report.action,
+                                    report.observed_samples,
+                                    report.cursor_start,
+                                    report.cursor_end
+                                );
+                            }
+                        }
+                        Err(error) => log::warn!("[AliceBot] scheduled reflection failed: {error}"),
+                    }
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(interval) => {}

@@ -35,7 +35,7 @@ static RUNTIME: std::sync::LazyLock<runtime::PluginRuntime> =
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 2,
+    config_version = 3,
     config_apply = "reload"
 )]
 mod plugin {

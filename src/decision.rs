@@ -48,6 +48,7 @@ pub struct ReplyDecision {
     pub p_rule: f32,
     pub p_final: f32,
     pub random_value: f32,
+    pub learned_reply_bias_offset: f32,
 }
 
 pub fn observe_message(msg: &InMessage) {
@@ -98,18 +99,36 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
             p_rule: 0.0,
             p_final: 0.0,
             random_value: deterministic_random(&msg.event_key, POLICY_VERSION),
+            learned_reply_bias_offset: 0.0,
         };
     }
 
     let signals = collect_signals(msg, &snapshot, &config);
-    evaluate_with_signals(msg, &config, &snapshot, signals)
+    let direct = signals.mentioned || signals.is_question || signals.is_reply_to_me;
+    let learned_reply_bias_offset = if direct {
+        0.0
+    } else {
+        crate::memory::reflection::reply_bias_offset()
+    };
+    evaluate_with_signals_and_offset(msg, &config, &snapshot, signals, learned_reply_bias_offset)
 }
 
+#[cfg(test)]
 fn evaluate_with_signals(
     msg: &InMessage,
     config: &crate::config::AppConfig,
     snapshot: &session::SessionSnapshot,
     signals: ReplySignals,
+) -> ReplyDecision {
+    evaluate_with_signals_and_offset(msg, config, snapshot, signals, 0.0)
+}
+
+fn evaluate_with_signals_and_offset(
+    msg: &InMessage,
+    config: &crate::config::AppConfig,
+    snapshot: &session::SessionSnapshot,
+    signals: ReplySignals,
+    learned_reply_bias_offset: f32,
 ) -> ReplyDecision {
     let direct = signals.mentioned || signals.is_question || signals.is_reply_to_me;
     let threshold = if direct {
@@ -117,7 +136,15 @@ fn evaluate_with_signals(
     } else {
         MIN_AUTONOMOUS_SCORE
     };
-    let score = score(&signals, config.reply_bias());
+    let applied_offset = if direct {
+        0.0
+    } else {
+        learned_reply_bias_offset
+    };
+    let score = score(
+        &signals,
+        reply_bias_for_decision(config.reply_bias(), direct, applied_offset),
+    );
     let p_rule = sigmoid((score - 50.0) / 12.0);
     let prior_denominator = snapshot.reply_alpha + snapshot.reply_beta;
     let participation_prior = if prior_denominator > 0.0 {
@@ -161,6 +188,7 @@ fn evaluate_with_signals(
         p_rule,
         p_final,
         random_value,
+        learned_reply_bias_offset: applied_offset,
     }
 }
 
@@ -227,6 +255,7 @@ fn persist_trace(msg: &InMessage, decision: &ReplyDecision, coalesced_count: usi
         "too_frequent": decision.signals.too_frequent,
         "out_of_topic": decision.signals.out_of_topic,
         "has_media": decision.signals.has_media,
+        "learned_reply_bias_offset": decision.learned_reply_bias_offset,
     })
     .to_string();
     let trace = crate::db::DecisionTrace {
@@ -435,6 +464,18 @@ pub fn score(signals: &ReplySignals, reply_bias: f32) -> f32 {
     (score + reply_bias.clamp(0.0, 1.0) * 20.0).clamp(0.0, 100.0)
 }
 
+pub(crate) fn reply_bias_for_decision(
+    base_reply_bias: f32,
+    direct: bool,
+    learned_reply_bias_offset: f32,
+) -> f32 {
+    if direct {
+        base_reply_bias.clamp(0.0, 1.0)
+    } else {
+        (base_reply_bias + learned_reply_bias_offset.clamp(-0.15, 0.15)).clamp(0.0, 1.0)
+    }
+}
+
 fn sigmoid(value: f32) -> f32 {
     (1.0 / (1.0 + (-value).exp())).clamp(0.0, 1.0)
 }
@@ -537,5 +578,11 @@ mod tests {
         assert!(sigmoid(-2.0) < sigmoid(0.0));
         assert!(sigmoid(0.0) < sigmoid(2.0));
         assert_eq!(sigmoid(0.0), 0.5);
+    }
+
+    #[test]
+    fn direct_requests_ignore_the_learned_reply_bias_offset() {
+        assert_eq!(reply_bias_for_decision(0.5, true, 0.15), 0.5);
+        assert_eq!(reply_bias_for_decision(0.5, false, 0.15), 0.65);
     }
 }

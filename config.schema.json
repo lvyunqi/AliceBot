@@ -266,7 +266,7 @@
         "compress_interval_hours": {
           "type": "integer",
           "title": "压缩间隔(小时)",
-          "description": "记忆压缩和反思的间隔时间",
+          "description": "记忆压缩任务的运行间隔",
           "minimum": 1,
           "maximum": 168,
           "default": 6
@@ -292,6 +292,46 @@
           "title": "启用知识库",
           "description": "是否从聊天中提取知识",
           "default": true
+        },
+        "reflection_enabled": {
+          "type": "boolean",
+          "title": "启用行为校准",
+          "description": "低频分析已接受的自主回复和静默决策，只微调受限的回复倾向",
+          "default": true
+        },
+        "reflection_interval_hours": {
+          "type": "integer",
+          "title": "校准间隔(小时)",
+          "description": "行为校准的最短运行间隔",
+          "minimum": 1,
+          "maximum": 168,
+          "default": 24
+        },
+        "reflection_min_decisions": {
+          "type": "integer",
+          "title": "最小观测样本",
+          "description": "达到此数量的已接受回复和静默决策后才允许校准",
+          "minimum": 10,
+          "maximum": 10000,
+          "default": 100
+        },
+        "reflection_learning_rate": {
+          "type": "number",
+          "title": "校准学习率",
+          "description": "每次回复倾向更新的最大步长，固定受限于 0.05",
+          "minimum": 0.001,
+          "maximum": 0.05,
+          "multipleOf": 0.001,
+          "default": 0.02
+        },
+        "reflection_target_autonomous_rate": {
+          "type": "number",
+          "title": "目标自主回复率",
+          "description": "稳定样本中希望由机器人主动参与的比例；超出安全区间会自动回滚",
+          "minimum": 0.05,
+          "maximum": 0.45,
+          "multipleOf": 0.01,
+          "default": 0.2
         }
       }
     },

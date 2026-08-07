@@ -6,6 +6,10 @@
 use serde::Deserialize;
 use std::collections::HashSet;
 
+pub(crate) const MAX_REFLECTION_LEARNING_RATE: f32 = 0.05;
+pub(crate) const MIN_REFLECTION_TARGET_AUTONOMOUS_RATE: f32 = 0.05;
+pub(crate) const MAX_REFLECTION_TARGET_AUTONOMOUS_RATE: f32 = 0.45;
+
 /// 应用配置（完整）
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct AppConfig {
@@ -301,6 +305,21 @@ pub struct MemoryConfig {
 
     #[serde(default = "default_true")]
     pub knowledge_enabled: bool,
+
+    #[serde(default = "default_true")]
+    pub reflection_enabled: bool,
+
+    #[serde(default = "default_reflection_interval")]
+    pub reflection_interval_hours: u64,
+
+    #[serde(default = "default_reflection_min_decisions")]
+    pub reflection_min_decisions: u64,
+
+    #[serde(default = "default_reflection_learning_rate")]
+    pub reflection_learning_rate: f32,
+
+    #[serde(default = "default_reflection_target_autonomous_rate")]
+    pub reflection_target_autonomous_rate: f32,
 }
 
 fn default_short_size() -> usize {
@@ -318,6 +337,18 @@ fn default_compress_messages() -> u64 {
 fn default_importance_threshold() -> u32 {
     30
 }
+fn default_reflection_interval() -> u64 {
+    24
+}
+fn default_reflection_min_decisions() -> u64 {
+    100
+}
+fn default_reflection_learning_rate() -> f32 {
+    0.02
+}
+fn default_reflection_target_autonomous_rate() -> f32 {
+    0.20
+}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -328,6 +359,11 @@ impl Default for MemoryConfig {
             compress_min_messages: default_compress_messages(),
             importance_threshold: default_importance_threshold(),
             knowledge_enabled: true,
+            reflection_enabled: true,
+            reflection_interval_hours: default_reflection_interval(),
+            reflection_min_decisions: default_reflection_min_decisions(),
+            reflection_learning_rate: default_reflection_learning_rate(),
+            reflection_target_autonomous_rate: default_reflection_target_autonomous_rate(),
         }
     }
 }
@@ -407,6 +443,28 @@ fn validate(config: &AppConfig) -> Result<(), String> {
         return Err("decision.coalesce_window_ms cannot exceed 3000".to_string());
     }
 
+    let memories = &config.memories;
+    if !(1..=168).contains(&memories.reflection_interval_hours) {
+        return Err("memories.reflection_interval_hours must be between 1 and 168".to_string());
+    }
+    if !(10..=10_000).contains(&memories.reflection_min_decisions) {
+        return Err("memories.reflection_min_decisions must be between 10 and 10000".to_string());
+    }
+    if !(0.0..=MAX_REFLECTION_LEARNING_RATE).contains(&memories.reflection_learning_rate)
+        || memories.reflection_learning_rate == 0.0
+    {
+        return Err(format!(
+            "memories.reflection_learning_rate must be greater than 0 and no more than {MAX_REFLECTION_LEARNING_RATE}"
+        ));
+    }
+    if !(MIN_REFLECTION_TARGET_AUTONOMOUS_RATE..=MAX_REFLECTION_TARGET_AUTONOMOUS_RATE)
+        .contains(&memories.reflection_target_autonomous_rate)
+    {
+        return Err(format!(
+            "memories.reflection_target_autonomous_rate must be between {MIN_REFLECTION_TARGET_AUTONOMOUS_RATE} and {MAX_REFLECTION_TARGET_AUTONOMOUS_RATE}"
+        ));
+    }
+
     let mut provider_ids = HashSet::new();
     for provider in &config.llm.providers {
         let id = provider.id.trim();
@@ -474,6 +532,19 @@ mod tests {
     }
 
     #[test]
+    fn business_validation_rejects_unsafe_reflection_parameters() {
+        let learning_rate =
+            parse_and_validate_config(r#"{"memories":{"reflection_learning_rate":0.06}}"#)
+                .expect_err("learning rate above the hard limit should fail");
+        assert!(learning_rate.contains("reflection_learning_rate"));
+
+        let target =
+            parse_and_validate_config(r#"{"memories":{"reflection_target_autonomous_rate":0.5}}"#)
+                .expect_err("target above the safety range should fail");
+        assert!(target.contains("reflection_target_autonomous_rate"));
+    }
+
+    #[test]
     fn business_validation_rejects_duplicate_provider_ids() {
         let error = parse_and_validate_config(
             r#"{
@@ -507,6 +578,7 @@ mod tests {
         let schema: serde_json::Value = serde_json::from_str(include_str!("../config.schema.json"))
             .expect("configuration schema should be valid JSON");
         assert!(schema["properties"]["decision"].is_object());
+        assert!(schema["properties"]["memories"]["properties"]["reflection_enabled"].is_object());
         assert!(schema["properties"]["behavior"]["properties"]["reply_bias"].is_null());
         assert!(schema["properties"]["behavior"]["properties"]["min_interval_sec"].is_null());
     }

@@ -82,7 +82,7 @@
       }
     },
     "memories": {
-      "ui:order": ["short_size", "long_topk", "compress_interval_hours", "compress_min_messages", "importance_threshold", "knowledge_enabled"],
+      "ui:order": ["short_size", "long_topk", "compress_interval_hours", "compress_min_messages", "importance_threshold", "knowledge_enabled", "reflection_enabled", "reflection_interval_hours", "reflection_min_decisions", "reflection_learning_rate", "reflection_target_autonomous_rate"],
       "short_size": {
         "unit": "条"
       },
@@ -94,6 +94,20 @@
       },
       "compress_min_messages": {
         "unit": "条"
+      },
+      "reflection_interval_hours": {
+        "unit": "小时"
+      },
+      "reflection_min_decisions": {
+        "unit": "条"
+      },
+      "reflection_learning_rate": {
+        "ui:widget": "slider",
+        "step": 0.001
+      },
+      "reflection_target_autonomous_rate": {
+        "ui:widget": "slider",
+        "step": 0.01
       }
     },
     "stickers": {

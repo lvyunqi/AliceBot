@@ -9,6 +9,7 @@ mod context;
 mod knowledge;
 pub mod long;
 pub mod persona;
+pub(crate) mod reflection;
 pub(crate) mod search;
 pub mod short;
 
