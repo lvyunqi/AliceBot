@@ -83,28 +83,20 @@ impl Llm for AnthropicClient {
             .json(&body)
             .send()
             .await
-            .map_err(|error| LlmError {
-                kind: if error.is_timeout() {
-                    ErrorKind::Timeout
-                } else {
-                    ErrorKind::Unknown
-                },
-                message: error.to_string(),
-            })?;
+            .map_err(|error| transport_error(&error))?;
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = truncate_error(response.text().await.unwrap_or_default());
-            return Err(LlmError {
-                kind: status_error_kind(status.as_u16()),
-                message: error_text,
-            });
+            return Err(http_status_error(
+                status_error_kind(status.as_u16()),
+                status.as_u16(),
+            ));
         }
 
-        let data: serde_json::Value = response.json().await.map_err(|error| LlmError {
-            kind: ErrorKind::Parse,
-            message: error.to_string(),
-        })?;
+        let data: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| response_parse_error("Anthropic"))?;
         let text = data["content"]
             .as_array()
             .and_then(|items| items.first())
@@ -187,5 +179,32 @@ mod tests {
             .await
             .expect_err("invalid history should fail");
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn http_error_does_not_expose_body_prompt_or_api_key() {
+        let (base_url, server) = spawn_json_server(
+            500,
+            r#"{"error":"raw-body-secret","echo":"prompt-secret api-key-secret"}"#,
+        );
+        let client = AnthropicClient::new(&base_url, "api-key-secret", Duration::from_secs(5));
+        let request = ChatRequest {
+            model: "claude-mock".to_string(),
+            system: Some("prompt-secret".to_string()),
+            messages: vec![ChatMessage::user("hello")],
+            temperature: 0.6,
+            max_tokens: 64,
+        };
+
+        let error = client
+            .chat(&request)
+            .await
+            .expect_err("HTTP 500 should fail");
+        let _ = server.join().expect("mock server should finish");
+        assert_eq!(error.kind, ErrorKind::Server);
+        assert_eq!(error.message, "provider returned HTTP 500");
+        assert!(!format!("{error:?}").contains("raw-body-secret"));
+        assert!(!error.message.contains("prompt-secret"));
+        assert!(!error.message.contains("api-key-secret"));
     }
 }

@@ -5,13 +5,14 @@
 
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::fmt;
 
 pub(crate) const MAX_REFLECTION_LEARNING_RATE: f32 = 0.05;
 pub(crate) const MIN_REFLECTION_TARGET_AUTONOMOUS_RATE: f32 = 0.05;
 pub(crate) const MAX_REFLECTION_TARGET_AUTONOMOUS_RATE: f32 = 0.45;
 
 /// 应用配置（完整）
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub persona: PersonaConfig,
@@ -33,6 +34,21 @@ pub struct AppConfig {
 
     #[serde(default)]
     pub send: SendConfig,
+}
+
+impl fmt::Debug for AppConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AppConfig")
+            .field("persona", &"[REDACTED]")
+            .field("llm", &self.llm)
+            .field("behavior", &self.behavior)
+            .field("decision", &self.decision)
+            .field("memories", &self.memories)
+            .field("stickers", &self.stickers)
+            .field("send", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl AppConfig {
@@ -135,7 +151,7 @@ fn default_retry_limit() -> u32 {
     1
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ProviderConfig {
     pub id: String,
 
@@ -156,6 +172,21 @@ pub struct ProviderConfig {
 
     #[serde(default)]
     pub priority: u32,
+}
+
+impl fmt::Debug for ProviderConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderConfig")
+            .field("id", &self.id)
+            .field("protocol", &self.protocol)
+            .field("base_url", &"[REDACTED]")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("enabled", &self.enabled)
+            .field("priority", &self.priority)
+            .finish()
+    }
 }
 
 fn default_protocol() -> String {
@@ -571,6 +602,30 @@ mod tests {
         .expect_err("non-HTTP provider URL should fail");
         assert!(error.contains("HTTP(S)"));
         assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn configuration_debug_redacts_secrets_and_prompt_fields() {
+        let config = parse_and_validate_config(
+            r#"{
+                "persona":{"background":"persona-secret"},
+                "send":{"account_id":"account-secret"},
+                "llm":{"providers":[{
+                    "id":"primary",
+                    "base_url":"https://example.com/v1?access_token=url-secret",
+                    "api_key":"api-key-secret",
+                    "protocol":"openai"
+                }]}
+            }"#,
+        )
+        .expect("configuration should be valid");
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("persona-secret"));
+        assert!(!debug.contains("account-secret"));
+        assert!(!debug.contains("url-secret"));
+        assert!(!debug.contains("api-key-secret"));
+        assert!(debug.contains("[REDACTED]"));
     }
 
     #[test]

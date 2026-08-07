@@ -6,6 +6,7 @@ pub mod openai;
 pub(crate) mod test_support;
 
 use async_trait::async_trait;
+use std::fmt;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -25,10 +26,20 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+}
+
+impl fmt::Debug for ChatMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatMessage")
+            .field("role", &self.role)
+            .field("content_chars", &self.content.chars().count())
+            .finish()
+    }
 }
 
 impl ChatMessage {
@@ -54,7 +65,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ChatRequest {
     pub model: String,
     pub system: Option<String>,
@@ -63,15 +74,62 @@ pub struct ChatRequest {
     pub max_tokens: u32,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for ChatRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatRequest")
+            .field("model", &self.model)
+            .field(
+                "system_chars",
+                &self
+                    .system
+                    .as_ref()
+                    .map(|text| text.chars().count())
+                    .unwrap_or(0),
+            )
+            .field("message_count", &self.messages.len())
+            .field(
+                "message_chars",
+                &self
+                    .messages
+                    .iter()
+                    .map(|message| message.content.chars().count())
+                    .sum::<usize>(),
+            )
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct ChatResponse {
     pub text: String,
 }
 
-#[derive(Debug, Clone)]
+impl fmt::Debug for ChatResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ChatResponse")
+            .field("text_chars", &self.text.chars().count())
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct LlmError {
     pub kind: ErrorKind,
     pub message: String,
+}
+
+impl fmt::Debug for LlmError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LlmError")
+            .field("kind", &self.kind)
+            .field("message", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,8 +144,35 @@ pub enum ErrorKind {
     Unknown,
 }
 
-pub(crate) fn truncate_error(message: String) -> String {
-    message.chars().take(1_024).collect()
+/// 将 transport 错误压缩为稳定分类，避免 URL 查询参数进入错误文本或日志。
+pub(crate) fn transport_error(error: &reqwest::Error) -> LlmError {
+    if error.is_timeout() {
+        LlmError {
+            kind: ErrorKind::Timeout,
+            message: "provider request timed out".to_string(),
+        }
+    } else {
+        LlmError {
+            kind: ErrorKind::Unknown,
+            message: "provider transport request failed".to_string(),
+        }
+    }
+}
+
+/// HTTP 错误只暴露状态码和分类，不读取或保留上游响应正文。
+pub(crate) fn http_status_error(kind: ErrorKind, status: u16) -> LlmError {
+    LlmError {
+        kind,
+        message: format!("provider returned HTTP {status}"),
+    }
+}
+
+/// JSON 解析失败使用固定文本，避免解析器携带响应片段或请求 URL。
+pub(crate) fn response_parse_error(provider: &str) -> LlmError {
+    LlmError {
+        kind: ErrorKind::Parse,
+        message: format!("{provider} response was not valid JSON"),
+    }
 }
 
 #[async_trait]
@@ -325,6 +410,31 @@ mod tests {
             max_tokens: 10,
         };
         assert_eq!(input_chars(&request), 8);
+    }
+
+    #[test]
+    fn debug_output_exposes_only_llm_metrics_and_error_kind() {
+        let request = ChatRequest {
+            model: "model".to_string(),
+            system: Some("system-prompt-secret".to_string()),
+            messages: vec![ChatMessage::user("user-prompt-secret")],
+            temperature: 1.0,
+            max_tokens: 10,
+        };
+        let response = ChatResponse {
+            text: "model-response-secret".to_string(),
+        };
+        let error = LlmError {
+            kind: ErrorKind::InvalidRequest,
+            message: "raw-http-body-secret".to_string(),
+        };
+
+        let debug = format!("{request:?} {response:?} {error:?}");
+        assert!(!debug.contains("system-prompt-secret"));
+        assert!(!debug.contains("user-prompt-secret"));
+        assert!(!debug.contains("model-response-secret"));
+        assert!(!debug.contains("raw-http-body-secret"));
+        assert!(debug.contains("InvalidRequest"));
     }
 
     struct RetryMock {
