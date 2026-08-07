@@ -3,6 +3,7 @@
 //! 三层记忆：短期（会话上下文） + 长期（重要事实） + 用户画像（识人）
 //! 另含知识库提取和压缩反思。
 
+mod candidates;
 pub mod compact;
 pub mod long;
 pub mod persona;
@@ -14,8 +15,8 @@ use crate::pipeline::InMessage;
 
 /// 观察用户（每条消息后更新画像）
 pub async fn observe_user(msg: &InMessage) {
-    // 更新用户画像
     persona::observe(msg).await;
+    candidates::observe(msg).await;
 }
 
 /// 推入短期上下文
@@ -53,15 +54,17 @@ pub async fn forget_by_keyword(keyword: &str) -> String {
         let now = chrono::Utc::now().timestamp_millis();
         let long_changed = connection
             .execute(
-                "UPDATE long_memory SET is_active = 0, updated_at = ?1
-                 WHERE is_active = 1 AND content LIKE ?2 ESCAPE '\\'",
+                "UPDATE long_memory
+                 SET is_active = 0, status = 'forgotten', archived_at = ?1, updated_at = ?1
+                 WHERE status <> 'forgotten' AND content LIKE ?2 ESCAPE '\\'",
                 rusqlite::params![now, pattern],
             )
             .unwrap_or(0);
         let knowledge_changed = connection
             .execute(
-                "UPDATE knowledge SET is_active = 0, updated_at = ?1
-                 WHERE is_active = 1 AND content LIKE ?2 ESCAPE '\\'",
+                "UPDATE knowledge
+                 SET is_active = 0, status = 'forgotten', updated_at = ?1
+                 WHERE status <> 'forgotten' AND content LIKE ?2 ESCAPE '\\'",
                 rusqlite::params![now, pattern],
             )
             .unwrap_or(0);
@@ -70,7 +73,5 @@ pub async fn forget_by_keyword(keyword: &str) -> String {
             long_changed, knowledge_changed
         );
     }
-    // TODO: 在 long_memory / knowledge 中查找并标记为非活跃
-    let _ = keyword;
     "我试着忘记这件事…嗯，好像本来也没记住什么 😅".to_string()
 }

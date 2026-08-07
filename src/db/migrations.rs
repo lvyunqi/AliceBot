@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 6;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DatabaseError {
@@ -121,6 +121,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
             migration_4_llm_audit(transaction)?;
         }
         6 => migration_6_session_state(transaction)?,
+        7 => migration_7_structured_memory(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -395,6 +396,101 @@ fn migration_6_session_state(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn migration_7_structured_memory(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(
+        conn,
+        "long_memory",
+        "normalized_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "long_memory",
+        "scope",
+        "TEXT NOT NULL DEFAULT 'session'",
+    )?;
+    ensure_column(
+        conn,
+        "long_memory",
+        "confidence",
+        "INTEGER NOT NULL DEFAULT 50",
+    )?;
+    ensure_column(
+        conn,
+        "long_memory",
+        "privacy",
+        "TEXT NOT NULL DEFAULT 'normal'",
+    )?;
+    ensure_column(
+        conn,
+        "long_memory",
+        "status",
+        "TEXT NOT NULL DEFAULT 'candidate'",
+    )?;
+    ensure_column(conn, "long_memory", "version", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "long_memory", "superseded_by", "INTEGER")?;
+    ensure_column(conn, "long_memory", "archived_at", "INTEGER")?;
+
+    ensure_column(
+        conn,
+        "knowledge",
+        "normalized_key",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "knowledge",
+        "scope",
+        "TEXT NOT NULL DEFAULT 'session'",
+    )?;
+    ensure_column(
+        conn,
+        "knowledge",
+        "status",
+        "TEXT NOT NULL DEFAULT 'candidate'",
+    )?;
+    ensure_column(conn, "knowledge", "version", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(conn, "knowledge", "superseded_by", "INTEGER")?;
+
+    conn.execute_batch(
+        r#"
+        UPDATE long_memory
+        SET normalized_key = 'legacy:memory:' || id
+        WHERE normalized_key = '';
+        UPDATE long_memory
+        SET status = CASE WHEN is_active = 1 THEN 'active' ELSE 'forgotten' END;
+
+        UPDATE knowledge
+        SET normalized_key = 'legacy:knowledge:' || id
+        WHERE normalized_key = '';
+        UPDATE knowledge
+        SET status = CASE WHEN is_active = 1 THEN 'active' ELSE 'forgotten' END;
+
+        CREATE TABLE IF NOT EXISTS memory_sources (
+            memory_id       INTEGER NOT NULL,
+            source_type     TEXT NOT NULL,
+            source_id       TEXT NOT NULL,
+            evidence_weight INTEGER NOT NULL DEFAULT 1,
+            created_at      INTEGER NOT NULL,
+            PRIMARY KEY (memory_id, source_type, source_id),
+            FOREIGN KEY (memory_id) REFERENCES long_memory(id) ON DELETE CASCADE
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_memory_key_version
+            ON long_memory(normalized_key, version);
+        CREATE INDEX IF NOT EXISTS idx_memory_retrieve_v7
+            ON long_memory(status, scope, subject_id, importance, confidence);
+        CREATE INDEX IF NOT EXISTS idx_memory_sources_source
+            ON memory_sources(source_type, source_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_knowledge_key_version
+            ON knowledge(normalized_key, version);
+        CREATE INDEX IF NOT EXISTS idx_knowledge_retrieve_v7
+            ON knowledge(status, scope, category, confidence);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -465,9 +561,39 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "reply_beta",
             ][..],
         ),
-        ("long_memory", &["content", "importance", "is_active"][..]),
+        (
+            "long_memory",
+            &[
+                "content",
+                "importance",
+                "confidence",
+                "normalized_key",
+                "scope",
+                "privacy",
+                "status",
+                "version",
+                "superseded_by",
+                "is_active",
+            ][..],
+        ),
+        (
+            "memory_sources",
+            &["memory_id", "source_type", "source_id", "evidence_weight"][..],
+        ),
         ("personas", &["subject_id", "nickname", "intimacy"][..]),
-        ("knowledge", &["content", "confidence", "is_active"][..]),
+        (
+            "knowledge",
+            &[
+                "content",
+                "confidence",
+                "normalized_key",
+                "scope",
+                "status",
+                "version",
+                "superseded_by",
+                "is_active",
+            ][..],
+        ),
         (
             "stickers",
             &["media_url", "file_hash", "source_session"][..],
@@ -503,6 +629,9 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_llm_calls_status_time",
         "idx_compaction_status_time",
         "ux_session_state_route",
+        "ux_memory_key_version",
+        "idx_memory_sources_source",
+        "ux_knowledge_key_version",
     ];
     for index in required_indexes {
         if !object_exists(conn, "index", index)? {
@@ -745,6 +874,47 @@ mod tests {
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(read_schema_version(&backup).unwrap(), 5);
         assert!(!object_exists(&backup, "table", "session_state").unwrap());
+    }
+
+    #[test]
+    fn version_six_database_backfills_structured_memory_state() {
+        let temporary = TempDatabase::new("version-six");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 6).unwrap();
+        connection
+            .execute(
+                "INSERT INTO long_memory
+                 (session_id, content, importance, is_active, created_at, updated_at)
+                 VALUES ('group-1', 'active legacy memory', 60, 1, 10, 10),
+                        ('group-1', 'forgotten legacy memory', 60, 0, 11, 11)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version six should migrate");
+        let connection = database.conn.lock().unwrap();
+        let rows = connection
+            .prepare("SELECT normalized_key, status FROM long_memory ORDER BY id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows[0].1, "active");
+        assert_eq!(rows[1].1, "forgotten");
+        assert_ne!(rows[0].0, rows[1].0);
+        assert!(object_exists(&connection, "table", "memory_sources").unwrap());
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 6);
+        assert!(!object_exists(&backup, "table", "memory_sources").unwrap());
     }
 
     #[test]

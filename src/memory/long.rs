@@ -1,9 +1,10 @@
 //! 长期记忆：持久化重要事实，并提供确定性的相关性检索。
 use crate::pipeline::db;
+use sha2::{Digest, Sha256};
 
 /// 按重要性和最近访问时间获取长期记忆。
 pub async fn retrieve_topk(session_id: &str, k: usize) -> Vec<String> {
-    retrieve_relevant(session_id, "", k).await
+    retrieve_relevant(session_id, None, "", k).await
 }
 
 /// 使用词法重叠、重要性、访问次数和新鲜度排序长期记忆。
@@ -11,12 +12,27 @@ pub async fn retrieve_topk(session_id: &str, k: usize) -> Vec<String> {
 /// 这是没有向量数据库时的可解释降级算法：英文按词匹配，中文按字符
 /// 匹配，再用重要性和时间作为平局排序。以后接入 embedding 时可以保留
 /// 这个路径作为离线或故障回退。
-pub async fn retrieve_relevant(session_id: &str, query: &str, k: usize) -> Vec<String> {
+pub async fn retrieve_relevant(
+    session_id: &str,
+    subject_id: Option<&str>,
+    query: &str,
+    k: usize,
+) -> Vec<String> {
+    let database = db();
+    retrieve_from(&database, session_id, subject_id, query, k)
+}
+
+fn retrieve_from(
+    database: &crate::db::Database,
+    session_id: &str,
+    subject_id: Option<&str>,
+    query: &str,
+    k: usize,
+) -> Vec<String> {
     if k == 0 {
         return Vec::new();
     }
 
-    let database = db();
     let now = chrono::Utc::now().timestamp_millis();
     let candidates = {
         let Ok(connection) = database.conn.lock() else {
@@ -24,11 +40,13 @@ pub async fn retrieve_relevant(session_id: &str, query: &str, k: usize) -> Vec<S
         };
         let candidate_limit = (k.saturating_mul(8)).clamp(k, 200) as i64;
         let mut statement = match connection.prepare(
-            "SELECT id, content, importance, access_count, created_at
+            "SELECT id, content, importance, confidence, access_count, created_at
              FROM long_memory
-             WHERE is_active = 1 AND (session_id = ?1 OR session_id IS NULL)
+             WHERE is_active = 1 AND status = 'active'
+               AND (session_id = ?1 OR session_id IS NULL)
+               AND (subject_id IS NULL OR subject_id = ?2)
              ORDER BY importance DESC, COALESCE(updated_at, created_at) DESC
-             LIMIT ?2",
+             LIMIT ?3",
         ) {
             Ok(statement) => statement,
             Err(error) => {
@@ -36,22 +54,25 @@ pub async fn retrieve_relevant(session_id: &str, query: &str, k: usize) -> Vec<S
                 return Vec::new();
             }
         };
-        let rows =
-            match statement.query_map(rusqlite::params![session_id, candidate_limit], |row| {
+        let rows = match statement.query_map(
+            rusqlite::params![session_id, subject_id, candidate_limit],
+            |row| {
                 Ok(MemoryCandidate {
                     id: row.get(0)?,
                     content: row.get(1)?,
                     importance: row.get(2)?,
-                    access_count: row.get(3)?,
-                    created_at: row.get(4)?,
+                    confidence: row.get(3)?,
+                    access_count: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
-            }) {
-                Ok(rows) => rows,
-                Err(error) => {
-                    log::warn!("[AliceBot] 长期记忆读取失败: {error}");
-                    return Vec::new();
-                }
-            };
+            },
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                log::warn!("[AliceBot] 长期记忆读取失败: {error}");
+                return Vec::new();
+            }
+        };
         rows.filter_map(Result::ok).collect::<Vec<_>>()
     };
 
@@ -68,6 +89,7 @@ pub async fn retrieve_relevant(session_id: &str, query: &str, k: usize) -> Vec<S
             let freshness = (20.0 - age_days).max(0.0);
             let score = overlap as i64 * 1_000
                 + i64::from(candidate.importance) * 10
+                + i64::from(candidate.confidence) * 5
                 + i64::from(candidate.access_count.min(100))
                 + freshness.round() as i64;
             (score, candidate)
@@ -105,17 +127,60 @@ pub async fn store(content: &str, session_id: Option<&str>, importance: i32) -> 
     }
     let now = chrono::Utc::now().timestamp_millis();
     let database = db();
-    let connection = database
+    let mut connection = database
         .conn
         .lock()
         .map_err(|_| "长期记忆数据库锁失败".to_string())?;
-    connection
+    let transaction = connection
+        .transaction()
+        .map_err(|error| error.to_string())?;
+    let scope = if session_id.is_some() {
+        "session"
+    } else {
+        "global"
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(session_id.unwrap_or_default().as_bytes());
+    hasher.update([0]);
+    hasher.update(content.trim().as_bytes());
+    let normalized_key = format!("manual:{}", hex_prefix(&hasher.finalize()));
+    transaction
         .execute(
-            "INSERT INTO long_memory (session_id, content, importance, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?4)",
-            rusqlite::params![session_id, content.trim(), importance.clamp(0, 100), now],
+            "INSERT INTO long_memory
+             (normalized_key, scope, session_id, content, kind, importance, confidence,
+              privacy, status, version, is_active, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, 80, 'normal', 'active', 1, 1, ?6, ?6)
+             ON CONFLICT(normalized_key, version) DO UPDATE SET
+                importance = MAX(long_memory.importance, excluded.importance),
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                normalized_key,
+                scope,
+                session_id,
+                content.trim(),
+                importance.clamp(0, 100),
+                now
+            ],
         )
         .map_err(|error| error.to_string())?;
+    let memory_id: i64 = transaction
+        .query_row(
+            "SELECT id FROM long_memory WHERE normalized_key = ?1 AND version = 1",
+            rusqlite::params![normalized_key],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO memory_sources
+             (memory_id, source_type, source_id, evidence_weight, created_at)
+             VALUES (?1, 'manual', ?2, 1, ?3)",
+            rusqlite::params![memory_id, normalized_key, now],
+        )
+        .map_err(|error| error.to_string())?;
+    transaction.commit().map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -123,8 +188,16 @@ struct MemoryCandidate {
     id: i64,
     content: String,
     importance: i32,
+    confidence: i32,
     access_count: i32,
     created_at: i64,
+}
+
+fn hex_prefix(bytes: &[u8]) -> String {
+    bytes[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn terms(text: &str) -> Vec<String> {
@@ -152,4 +225,42 @@ fn terms(text: &str) -> Vec<String> {
     result.sort();
     result.dedup();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retrieval_excludes_candidates_forgotten_rows_and_other_subjects() {
+        let database = crate::db::Database::open(":memory:").unwrap();
+        let connection = database.conn.lock().unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO long_memory
+                 (normalized_key, scope, session_id, subject_id, content, kind,
+                  importance, confidence, privacy, status, version, is_active,
+                  created_at, updated_at)
+                 VALUES
+                 ('candidate', 'user_session', 'group-1', 'user-1', '喜欢：候选',
+                  'preference', 90, 80, 'normal', 'candidate', 1, 0, 10, 10),
+                 ('active-own', 'user_session', 'group-1', 'user-1', '喜欢：咖啡',
+                  'preference', 70, 90, 'normal', 'active', 1, 1, 11, 11),
+                 ('active-other', 'user_session', 'group-1', 'user-2', '喜欢：茶',
+                  'preference', 70, 90, 'normal', 'active', 1, 1, 12, 12),
+                 ('forgotten', 'user_session', 'group-1', 'user-1', '喜欢：旧事',
+                  'preference', 90, 90, 'normal', 'forgotten', 1, 0, 13, 13),
+                 ('global', 'global', NULL, NULL, '群公告：周五开会',
+                  'fact', 60, 80, 'normal', 'active', 1, 1, 14, 14);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let memories = retrieve_from(&database, "group-1", Some("user-1"), "咖啡", 10);
+        assert!(memories.contains(&"喜欢：咖啡".to_string()));
+        assert!(memories.contains(&"群公告：周五开会".to_string()));
+        assert!(!memories.contains(&"喜欢：候选".to_string()));
+        assert!(!memories.contains(&"喜欢：茶".to_string()));
+        assert!(!memories.contains(&"喜欢：旧事".to_string()));
+    }
 }

@@ -559,8 +559,13 @@ async fn generate_reply(msg: &InMessage) -> Result<String, String> {
     let long_memories = if state.config.memories.long_topk == 0 {
         Vec::new()
     } else {
-        memory::long::retrieve_relevant(&msg.session_id, &content, state.config.memories.long_topk)
-            .await
+        memory::long::retrieve_relevant(
+            &msg.session_id,
+            Some(&msg.sender_id),
+            &content,
+            state.config.memories.long_topk,
+        )
+        .await
     };
     let mut system = persona_prompt(&state.config);
     if let Some(profile) = memory::persona::summary(&msg.sender_id) {
@@ -675,6 +680,23 @@ fn persona_prompt(config: &AppConfig) -> String {
 
 /// 获取状态（/status 命令）。
 pub async fn get_status() -> String {
+    struct StatusMetrics {
+        message_count: i64,
+        llm_success: i64,
+        llm_errors: i64,
+        outbound_accepted: i64,
+        outbound_failures: i64,
+        decision_replies: i64,
+        decision_batches: i64,
+        active_sessions: i64,
+        average_activity: f64,
+        memory_candidates: i64,
+        memory_active: i64,
+        memory_forgotten: i64,
+        memory_sources: i64,
+        compactions: i64,
+    }
+
     let metrics = try_db().and_then(|database| {
         let connection = database.conn.lock().ok()?;
         let count = |sql: &str| {
@@ -689,44 +711,60 @@ pub async fn get_status() -> String {
                 |row| row.get::<_, f64>(0),
             )
             .unwrap_or(-1.0);
-        Some((
-            count("SELECT COUNT(*) FROM messages"),
-            count("SELECT COUNT(*) FROM llm_calls WHERE status = 'success'"),
-            count("SELECT COUNT(*) FROM llm_calls WHERE status = 'error'"),
-            count("SELECT COUNT(*) FROM outbound_messages WHERE status = 'accepted'"),
-            count("SELECT COUNT(*) FROM outbound_messages WHERE status IN ('rejected', 'invalid')"),
-            count("SELECT COUNT(*) FROM decision_traces WHERE outcome = 'reply'"),
-            count("SELECT COUNT(*) FROM decision_traces WHERE outcome = 'batch'"),
-            count("SELECT COUNT(*) FROM session_state"),
+        Some(StatusMetrics {
+            message_count: count("SELECT COUNT(*) FROM messages"),
+            llm_success: count("SELECT COUNT(*) FROM llm_calls WHERE status = 'success'"),
+            llm_errors: count("SELECT COUNT(*) FROM llm_calls WHERE status = 'error'"),
+            outbound_accepted: count(
+                "SELECT COUNT(*) FROM outbound_messages WHERE status = 'accepted'",
+            ),
+            outbound_failures: count(
+                "SELECT COUNT(*) FROM outbound_messages WHERE status IN ('rejected', 'invalid')",
+            ),
+            decision_replies: count("SELECT COUNT(*) FROM decision_traces WHERE outcome = 'reply'"),
+            decision_batches: count("SELECT COUNT(*) FROM decision_traces WHERE outcome = 'batch'"),
+            active_sessions: count("SELECT COUNT(*) FROM session_state"),
             average_activity,
-            count("SELECT COUNT(*) FROM compaction_runs WHERE status = 'completed'"),
-        ))
+            memory_candidates: count("SELECT COUNT(*) FROM long_memory WHERE status = 'candidate'"),
+            memory_active: count("SELECT COUNT(*) FROM long_memory WHERE status = 'active'"),
+            memory_forgotten: count("SELECT COUNT(*) FROM long_memory WHERE status = 'forgotten'"),
+            memory_sources: count("SELECT COUNT(*) FROM memory_sources"),
+            compactions: count("SELECT COUNT(*) FROM compaction_runs WHERE status = 'completed'"),
+        })
     });
-    let (
-        message_count,
-        llm_success,
-        llm_errors,
-        outbound_accepted,
-        outbound_failures,
-        decision_replies,
-        decision_batches,
-        active_sessions,
-        average_activity,
-        compactions,
-    ) = metrics.unwrap_or((-1, -1, -1, -1, -1, -1, -1, -1, -1.0, -1));
+    let metrics = metrics.unwrap_or(StatusMetrics {
+        message_count: -1,
+        llm_success: -1,
+        llm_errors: -1,
+        outbound_accepted: -1,
+        outbound_failures: -1,
+        decision_replies: -1,
+        decision_batches: -1,
+        active_sessions: -1,
+        average_activity: -1.0,
+        memory_candidates: -1,
+        memory_active: -1,
+        memory_forgotten: -1,
+        memory_sources: -1,
+        compactions: -1,
+    });
 
     json!({
         "status": "running",
-        "message_count": message_count,
-        "llm_success": llm_success,
-        "llm_errors": llm_errors,
-        "outbound_accepted": outbound_accepted,
-        "outbound_failures": outbound_failures,
-        "decision_replies": decision_replies,
-        "decision_batches": decision_batches,
-        "active_sessions": active_sessions,
-        "average_activity": average_activity,
-        "compactions": compactions,
+        "message_count": metrics.message_count,
+        "llm_success": metrics.llm_success,
+        "llm_errors": metrics.llm_errors,
+        "outbound_accepted": metrics.outbound_accepted,
+        "outbound_failures": metrics.outbound_failures,
+        "decision_replies": metrics.decision_replies,
+        "decision_batches": metrics.decision_batches,
+        "active_sessions": metrics.active_sessions,
+        "average_activity": metrics.average_activity,
+        "memory_candidates": metrics.memory_candidates,
+        "memory_active": metrics.memory_active,
+        "memory_forgotten": metrics.memory_forgotten,
+        "memory_sources": metrics.memory_sources,
+        "compactions": metrics.compactions,
         "version": env!("CARGO_PKG_VERSION"),
     })
     .to_string()

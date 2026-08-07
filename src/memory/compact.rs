@@ -1,5 +1,6 @@
 //! Recoverable deterministic conversation compaction.
 use crate::config::AppConfig;
+use sha2::{Digest, Sha256};
 
 /// Compress new inbound journal rows into per-session long-memory summaries.
 /// Raw messages remain available for audit and replay; the cursor only controls
@@ -69,20 +70,32 @@ pub async fn run_if_due(config: &AppConfig) -> Result<usize, String> {
                 "会话摘要：本批包含 {} 条消息，时间范围 {} 到 {}。代表性片段：{}",
                 batch.count, batch.first_at, batch.last_at, samples
             );
+            let normalized_key = summary_key(&run_key, &batch.session_id);
             transaction
                 .execute(
                     "INSERT INTO long_memory
-                     (session_id, content, kind, importance, is_active, created_at, updated_at)
-                     VALUES (?1, ?2, 'conversation_summary', ?3, 1, ?4, ?4)",
+                     (normalized_key, scope, session_id, content, kind, importance,
+                      confidence, privacy, status, version, is_active, created_at, updated_at)
+                     VALUES (?1, 'session', ?2, ?3, 'conversation_summary', ?4,
+                             80, 'normal', 'active', 1, 1, ?5, ?5)",
                     rusqlite::params![
+                        normalized_key,
                         batch.session_id,
                         summary,
                         i32::try_from(config.memories.importance_threshold)
                             .unwrap_or(30)
-                            .max(40)
-                            .min(100),
+                            .clamp(40, 100),
                         finished_at
                     ],
+                )
+                .map_err(|error| error.to_string())?;
+            let memory_id = transaction.last_insert_rowid();
+            transaction
+                .execute(
+                    "INSERT INTO memory_sources
+                     (memory_id, source_type, source_id, evidence_weight, created_at)
+                     VALUES (?1, 'reflection', ?2, 1, ?3)",
+                    rusqlite::params![memory_id, run_key, finished_at],
                 )
                 .map_err(|error| error.to_string())?;
         }
@@ -136,6 +149,19 @@ pub async fn run_if_due(config: &AppConfig) -> Result<usize, String> {
         end_cursor
     );
     Ok(processed_count as usize)
+}
+
+fn summary_key(run_key: &str, session_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(run_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(session_id.as_bytes());
+    let digest = hasher.finalize();
+    let suffix = digest[..12]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("summary:{suffix}")
 }
 
 fn finish_failed(database: &crate::db::Database, run_key: &str, error: &str) {
@@ -276,6 +302,14 @@ mod tests {
             )
             .expect("summary should exist");
         assert_eq!(summary_count, 1);
+        let source_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM memory_sources WHERE source_type = 'reflection'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("summary source should exist");
+        assert_eq!(source_count, 1);
         drop(connection);
         assert_eq!(
             database.get_meta("compaction_cursor").unwrap().as_deref(),
