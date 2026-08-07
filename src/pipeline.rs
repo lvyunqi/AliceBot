@@ -1,11 +1,12 @@
 //! 消息异步流水线。
 //!
-//! FFI 回调只把 `NoticeRequest` 中的 ABI 字符串复制到 `NoticeEvent`，之后所有
+//! FFI 回调只把 `InterceptorRequest` 中的 ABI 字段复制到 `InboundEvent`，之后所有
 //! 处理都使用插件自己拥有的数据，避免宿主请求引用逃逸到异步 runtime。
 
-use abi_stable_host_api::{CommandRequest, NoticeRequest};
+use abi_stable_host_api::{CommandRequest, InterceptorRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::config::AppConfig;
@@ -18,16 +19,27 @@ use crate::stickers;
 
 /// 从宿主请求复制出的、可安全跨异步边界的数据。
 #[derive(Debug, Clone)]
-pub struct NoticeEvent {
-    pub route: String,
+pub struct InboundEvent {
+    pub sender_id: String,
+    pub group_id: String,
+    pub message_text: String,
     pub raw_event_json: String,
+    pub sender_nickname: String,
+    pub message_id: String,
+    pub timestamp: i64,
 }
 
-impl NoticeEvent {
-    pub fn from_request(req: &NoticeRequest) -> Self {
+impl InboundEvent {
+    /// 复制宿主 ABI 值，确保同步回调返回后异步任务不再借用动态请求。
+    pub fn from_request(req: &InterceptorRequest) -> Self {
         Self {
-            route: req.route.as_str().to_owned(),
+            sender_id: req.sender_id.as_str().to_owned(),
+            group_id: req.group_id.as_str().to_owned(),
+            message_text: req.message_text.as_str().to_owned(),
             raw_event_json: req.raw_event_json.as_str().to_owned(),
+            sender_nickname: req.sender_nickname.as_str().to_owned(),
+            message_id: req.message_id.as_str().to_owned(),
+            timestamp: req.timestamp,
         }
     }
 }
@@ -126,7 +138,7 @@ pub fn db() -> Arc<Database> {
 }
 
 /// 在同步 FFI 回调内完成轻量规范化和单行 journal，成功后才进入有界处理队列。
-pub fn record_inbound(event: NoticeEvent) -> Result<Option<InMessage>, String> {
+pub fn record_inbound(event: InboundEvent) -> Result<Option<InMessage>, String> {
     let msg = normalize_message(&event);
     let database = try_db().ok_or_else(|| "database is not initialized".to_string())?;
 
@@ -277,12 +289,21 @@ async fn process_recorded_message_inner(msg: InMessage) {
 }
 
 /// 将官方 QQ/OneBot 的原始事件转换成统一结构。
-fn normalize_message(event: &NoticeEvent) -> InMessage {
+fn normalize_message(event: &InboundEvent) -> InMessage {
     let parsed = serde_json::from_str::<Value>(&event.raw_event_json).unwrap_or_else(|_| json!({}));
     let payload = parsed.get("d").unwrap_or(&parsed);
-    let official = is_official_qq(&parsed, payload);
-    let protocol = if official { "qq-official" } else { "onebot11" }.to_string();
-    let bot_account_id = first_string(&parsed, &["self_id", "bot_id", "account_id"])
+    let native_payload = parsed.get("qqbot_payload").unwrap_or(payload);
+    let qimen_context = parsed.get("qimen_context").unwrap_or(&Value::Null);
+    let protocol = first_string(qimen_context, &["protocol"]).unwrap_or_else(|| {
+        if is_official_qq(&parsed, payload, native_payload) {
+            "qq-official".to_string()
+        } else {
+            "onebot11".to_string()
+        }
+    });
+    let official = protocol == "qq-official";
+    let bot_account_id = first_string(qimen_context, &["account_id"])
+        .or_else(|| first_string(&parsed, &["self_id", "account_id"]))
         .or_else(|| first_string(payload, &["self_id", "bot_id", "account_id"]))
         .or_else(|| {
             crate::pipeline::state()
@@ -291,9 +312,14 @@ fn normalize_message(event: &NoticeEvent) -> InMessage {
         })
         .unwrap_or_default();
 
-    let session_type = if first_string(payload, &["group_openid", "group_id"]).is_some() {
+    let session_type = if first_string(payload, &["group_openid", "group_id"]).is_some()
+        || first_string(native_payload, &["group_openid", "group_id"]).is_some()
+        || !event.group_id.is_empty()
+    {
         "group"
-    } else if first_string(payload, &["channel_id"]).is_some() {
+    } else if first_string(payload, &["channel_id"]).is_some()
+        || first_string(native_payload, &["channel_id"]).is_some()
+    {
         "channel"
     } else {
         "private"
@@ -301,8 +327,12 @@ fn normalize_message(event: &NoticeEvent) -> InMessage {
     .to_string();
 
     let session_id = if session_type == "channel" {
-        let guild = first_string(payload, &["guild_id"]).unwrap_or_default();
-        let channel = first_string(payload, &["channel_id"]).unwrap_or_default();
+        let guild = first_string(payload, &["guild_id"])
+            .or_else(|| first_string(native_payload, &["guild_id"]))
+            .unwrap_or_default();
+        let channel = first_string(payload, &["channel_id"])
+            .or_else(|| first_string(native_payload, &["channel_id"]))
+            .unwrap_or_default();
         if guild.is_empty() {
             channel
         } else {
@@ -317,18 +347,45 @@ fn normalize_message(event: &NoticeEvent) -> InMessage {
                 &["group_id", "user_id"]
             },
         )
-        .unwrap_or_else(|| event.route.clone())
+        .or_else(|| {
+            first_string(
+                native_payload,
+                if official {
+                    &["group_openid", "group_id", "user_openid", "user_id"]
+                } else {
+                    &["group_id", "user_id"]
+                },
+            )
+        })
+        .or_else(|| (!event.group_id.is_empty()).then(|| event.group_id.clone()))
+        .or_else(|| (!event.sender_id.is_empty()).then(|| event.sender_id.clone()))
+        .unwrap_or_default()
     };
 
     let author = payload.get("author").unwrap_or(&Value::Null);
+    let native_author = native_payload.get("author").unwrap_or(&Value::Null);
     let sender_id = first_string(author, &["member_openid", "user_openid", "id", "user_id"])
+        .or_else(|| {
+            first_string(
+                native_author,
+                &["member_openid", "user_openid", "id", "user_id"],
+            )
+        })
         .or_else(|| first_string(payload, &["user_id", "sender_id", "sender_openid"]))
+        .or_else(|| (!event.sender_id.is_empty()).then(|| event.sender_id.clone()))
         .unwrap_or_else(|| session_id.clone());
+    let sender = payload.get("sender").unwrap_or(&Value::Null);
     let sender_name = first_string(author, &["username", "nickname", "card"])
+        .or_else(|| first_string(native_author, &["username", "nickname", "card"]))
+        .or_else(|| first_string(sender, &["nickname", "username", "card"]))
         .or_else(|| first_string(payload, &["sender_name", "nickname"]))
+        .or_else(|| (!event.sender_nickname.is_empty()).then(|| event.sender_nickname.clone()))
         .unwrap_or_default();
 
-    let message_id = first_string(payload, &["id", "message_id"]).unwrap_or_default();
+    let message_id = first_string(payload, &["id", "message_id"])
+        .or_else(|| first_string(native_payload, &["id", "message_id"]))
+        .or_else(|| (!event.message_id.is_empty()).then(|| event.message_id.clone()))
+        .unwrap_or_default();
     let reply_to_id = first_string(payload, &["reply_to_id", "reply_message_id"])
         .or_else(|| {
             payload
@@ -336,17 +393,22 @@ fn normalize_message(event: &NoticeEvent) -> InMessage {
                 .and_then(|reference| first_string(reference, &["message_id", "id"]))
         })
         .unwrap_or_default();
-    let content =
+    let content = if event.message_text.is_empty() {
         first_string(payload, &["content", "raw_message", "message"]).unwrap_or_else(|| {
             payload
                 .get("message")
                 .map(text_from_segments)
                 .unwrap_or_default()
-        });
-    let media = extract_media(payload);
+        })
+    } else {
+        event.message_text.clone()
+    };
+    let media = extract_media(payload, native_payload);
     let at_me = detect_at_me(&parsed, payload);
-    let timestamp =
-        timestamp_millis(payload).unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    let timestamp = timestamp_millis(payload)
+        .or_else(|| timestamp_millis(native_payload))
+        .or_else(|| normalize_host_timestamp(event.timestamp))
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
     let safe_raw_json = redacted_json(&parsed);
     let event_key = if message_id.is_empty() {
         format!("{protocol}:{}", digest_hex(safe_raw_json.as_bytes()))
@@ -373,15 +435,20 @@ fn normalize_message(event: &NoticeEvent) -> InMessage {
     }
 }
 
-fn is_official_qq(root: &Value, payload: &Value) -> bool {
+fn is_official_qq(root: &Value, payload: &Value, native_payload: &Value) -> bool {
     root.get("t")
         .and_then(Value::as_str)
         .map(|event| event.ends_with("_MESSAGE_CREATE"))
         .unwrap_or(false)
         || first_string(payload, &["group_openid", "user_openid"]).is_some()
+        || first_string(native_payload, &["group_openid", "user_openid"]).is_some()
         || payload
             .get("author")
             .and_then(|author| first_string(author, &["member_openid"]))
+            .is_some()
+        || native_payload
+            .get("author")
+            .and_then(|author| first_string(author, &["member_openid", "user_openid"]))
             .is_some()
 }
 
@@ -423,11 +490,22 @@ fn text_from_segments(value: &Value) -> String {
         .join("")
 }
 
-fn extract_media(payload: &Value) -> Vec<MediaRef> {
+fn extract_media(payload: &Value, native_payload: &Value) -> Vec<MediaRef> {
     let mut media = Vec::new();
+    let mut seen = HashSet::new();
+    extract_media_from(payload, &mut seen, &mut media);
+    if !std::ptr::eq(payload, native_payload) {
+        extract_media_from(native_payload, &mut seen, &mut media);
+    }
+    media
+}
+
+fn extract_media_from(payload: &Value, seen: &mut HashSet<String>, media: &mut Vec<MediaRef>) {
     if let Some(attachments) = payload.get("attachments").and_then(Value::as_array) {
         for attachment in attachments {
-            if let Some(url) = first_string(attachment, &["url"]) {
+            if let Some(url) = first_string(attachment, &["url"])
+                && seen.insert(url.clone())
+            {
                 media.push(MediaRef {
                     url,
                     media_type: first_string(attachment, &["content_type", "type"])
@@ -449,6 +527,7 @@ fn extract_media(payload: &Value) -> Vec<MediaRef> {
             let data = segment.get("data").unwrap_or(&Value::Null);
             if let Some(url) = first_string(data, &["url", "file"])
                 .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .filter(|url| seen.insert(url.clone()))
             {
                 media.push(MediaRef {
                     url,
@@ -457,12 +536,12 @@ fn extract_media(payload: &Value) -> Vec<MediaRef> {
             }
         }
     }
-    media
 }
 
 fn detect_at_me(root: &Value, payload: &Value) -> bool {
     if payload
         .get("at_me")
+        .or_else(|| payload.get("to_me"))
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
@@ -503,6 +582,16 @@ fn timestamp_millis(payload: &Value) -> Option<i64> {
         number.saturating_mul(1000)
     } else {
         number
+    })
+}
+
+fn normalize_host_timestamp(timestamp: i64) -> Option<i64> {
+    (timestamp > 0).then(|| {
+        if timestamp < 1_000_000_000_000 {
+            timestamp.saturating_mul(1_000)
+        } else {
+            timestamp
+        }
     })
 }
 
@@ -792,23 +881,38 @@ pub async fn get_status() -> String {
 mod tests {
     use super::*;
 
-    fn official_group_event() -> NoticeEvent {
-        NoticeEvent {
-            route: "GROUP_MESSAGE_CREATE".to_string(),
+    fn inbound_event(request: InterceptorRequest) -> InboundEvent {
+        InboundEvent::from_request(&request)
+    }
+
+    fn official_group_event() -> InboundEvent {
+        inbound_event(InterceptorRequest {
+            bot_id: "qq-main".into(),
+            sender_id: "member-1".into(),
+            group_id: "group-1".into(),
+            message_text: "你好".into(),
             raw_event_json: r#"{
-                "t":"GROUP_MESSAGE_CREATE",
-                "d":{
+                "post_type":"message",
+                "message_id":"message-1",
+                "group_openid":"group-1",
+                "user_id":"member-1",
+                "message":"你好",
+                "sender":{"nickname":"夜空"},
+                "qqbot_payload":{
                     "id":"message-1",
                     "group_openid":"group-1",
-                    "content":"",
-                    "timestamp":"2026-08-07T01:02:24+08:00",
+                    "content":"你好",
                     "author":{"member_openid":"member-1","username":"夜空"},
                     "attachments":[{"content_type":"image/png","url":"https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=temporary&spec=0"}],
                     "message_scene":{"ext":["auth_token=do-not-persist"],"source":"default"}
-                }
+                },
+                "qimen_context":{"version":1,"protocol":"qq-official","bot_instance":"qq-main","account_id":"bot-account"}
             }"#
-            .to_string(),
-        }
+            .into(),
+            sender_nickname: "夜空".into(),
+            message_id: "message-1".into(),
+            timestamp: 1_786_057_344,
+        })
     }
 
     #[test]
@@ -818,8 +922,11 @@ mod tests {
         assert_eq!(message.session_type, "group");
         assert_eq!(message.session_id, "group-1");
         assert_eq!(message.sender_id, "member-1");
+        assert_eq!(message.sender_name, "夜空");
         assert_eq!(message.message_id, "message-1");
-        assert!(message.content.is_empty());
+        assert_eq!(message.content, "你好");
+        assert_eq!(message.bot_account_id, "bot-account");
+        assert_eq!(message.timestamp, 1_786_057_344_000);
         assert_eq!(message.media.len(), 1);
         assert!(message.media[0].url.contains("rkey=temporary"));
         assert!(!message.safe_raw_json.contains("auth_token"));
@@ -831,8 +938,11 @@ mod tests {
 
     #[test]
     fn normalizes_onebot_text_segments() {
-        let event = NoticeEvent {
-            route: "GroupMessage".to_string(),
+        let event = inbound_event(InterceptorRequest {
+            bot_id: "onebot-main".into(),
+            sender_id: "7".into(),
+            group_id: "99".into(),
+            message_text: "你好".into(),
             raw_event_json: r#"{
                 "self_id":123,
                 "message_id":42,
@@ -842,15 +952,46 @@ mod tests {
                     {"type":"text","data":{"text":"你好"}},
                     {"type":"image","data":{"url":"https://example.com/b.png"}}
                 ],
-                "time":1722963744
+                "time":1722963744,
+                "qimen_context":{"version":1,"protocol":"onebot11","bot_instance":"onebot-main","account_id":"123"}
             }"#
-            .to_string(),
-        };
+            .into(),
+            sender_nickname: "测试用户".into(),
+            message_id: "42".into(),
+            timestamp: 1_722_963_744,
+        });
         let message = normalize_message(&event);
         assert_eq!(message.protocol, "onebot11");
+        assert_eq!(message.bot_account_id, "123");
         assert_eq!(message.session_id, "99");
         assert_eq!(message.sender_id, "7");
-        assert!(message.content.contains("你好"));
+        assert_eq!(message.sender_name, "测试用户");
+        assert_eq!(message.content, "你好");
         assert!(message.has_media);
+    }
+
+    #[test]
+    fn uses_interceptor_fields_when_raw_json_is_unavailable() {
+        let event = inbound_event(InterceptorRequest {
+            bot_id: "onebot-main".into(),
+            sender_id: "user-1".into(),
+            group_id: "group-1".into(),
+            message_text: "宿主规范文本".into(),
+            raw_event_json: "not-json".into(),
+            sender_nickname: "测试用户".into(),
+            message_id: "message-1".into(),
+            timestamp: 1_722_963_744,
+        });
+
+        let message = normalize_message(&event);
+        assert_eq!(message.protocol, "onebot11");
+        assert_eq!(message.session_type, "group");
+        assert_eq!(message.session_id, "group-1");
+        assert_eq!(message.sender_id, "user-1");
+        assert_eq!(message.sender_name, "测试用户");
+        assert_eq!(message.message_id, "message-1");
+        assert_eq!(message.content, "宿主规范文本");
+        assert_eq!(message.timestamp, 1_722_963_744_000);
+        assert_eq!(message.safe_raw_json, "{}");
     }
 }

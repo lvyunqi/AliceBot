@@ -6,8 +6,8 @@
 #![deny(unsafe_code)]
 
 use abi_stable_host_api::{
-    CommandRequest, CommandResponse, InterceptorRequest, InterceptorResponse, NoticeRequest,
-    NoticeResponse, PluginInitConfig, PluginInitResult,
+    CommandRequest, CommandResponse, InterceptorRequest, InterceptorResponse, PluginInitConfig,
+    PluginInitResult,
 };
 use qimen_dynamic_plugin_derive::dynamic_plugin;
 
@@ -27,6 +27,35 @@ pub mod stickers;
 // 生命周期由 #[init] / #[shutdown] 管理
 static RUNTIME: std::sync::LazyLock<runtime::PluginRuntime> =
     std::sync::LazyLock::new(runtime::PluginRuntime::new);
+
+/// 在动态拦截器回调内先写入 journal，再把自有消息提交给异步处理队列。
+fn accept_inbound_message(req: &InterceptorRequest) {
+    let rt = &*RUNTIME;
+    let event = pipeline::InboundEvent::from_request(req);
+    match pipeline::record_inbound(event) {
+        Ok(Some(message)) => match rt.submit_message(message.clone()) {
+            runtime::MessageSubmitResult::Enqueued => {}
+            runtime::MessageSubmitResult::Full => {
+                pipeline::mark_record_only(&message.event_key, "queue_full");
+                log::warn!(
+                    "[AliceBot] 入站处理队列已满，保留 record_only event_key={}",
+                    message.event_key
+                );
+            }
+            runtime::MessageSubmitResult::Unavailable => {
+                pipeline::mark_record_only(&message.event_key, "runtime_unavailable");
+                log::warn!(
+                    "[AliceBot] runtime 不可用，保留 record_only event_key={}",
+                    message.event_key
+                );
+            }
+        },
+        Ok(None) => {}
+        Err(error) => {
+            log::error!("[AliceBot] 入站消息 journal 失败: {error}");
+        }
+    }
+}
 
 // ─── 动态插件描述符 ────────────────────────────────────────────
 
@@ -123,44 +152,10 @@ mod plugin {
     // ── 消息拦截 (pre_handle) ──────────────────────────────────
 
     #[pre_handle]
-    fn pre_handle(_req: &InterceptorRequest) -> InterceptorResponse {
-        // 不做全量拦截，只做快速过滤
-        // 实际消息处理交给 route 回调
+    fn pre_handle(req: &InterceptorRequest) -> InterceptorResponse {
+        // 普通消息只会经过拦截器链；notice route 不会收到群聊或私聊消息。
+        accept_inbound_message(req);
         InterceptorResponse::allow()
-    }
-
-    // ── 消息路由 ───────────────────────────────────────────────
-
-    #[route(kind = "notice", events = "GroupMessage,PrivateMessage")]
-    fn on_message(req: &NoticeRequest) -> NoticeResponse {
-        let rt = &*RUNTIME;
-        let event = pipeline::NoticeEvent::from_request(req);
-        match pipeline::record_inbound(event) {
-            Ok(Some(message)) => match rt.submit_message(message.clone()) {
-                runtime::MessageSubmitResult::Enqueued => {}
-                runtime::MessageSubmitResult::Full => {
-                    pipeline::mark_record_only(&message.event_key, "queue_full");
-                    log::warn!(
-                        "[AliceBot] 入站处理队列已满，保留 record_only event_key={}",
-                        message.event_key
-                    );
-                }
-                runtime::MessageSubmitResult::Unavailable => {
-                    pipeline::mark_record_only(&message.event_key, "runtime_unavailable");
-                    log::warn!(
-                        "[AliceBot] runtime 不可用，保留 record_only event_key={}",
-                        message.event_key
-                    );
-                }
-            },
-            Ok(None) => {}
-            Err(error) => {
-                log::error!("[AliceBot] 入站消息 journal 失败: {error}");
-            }
-        }
-        NoticeResponse {
-            action: abi_stable_host_api::DynamicActionResponse::ignore(),
-        }
     }
 
     // ── 命令 ───────────────────────────────────────────────────
