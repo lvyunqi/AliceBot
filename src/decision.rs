@@ -1,10 +1,16 @@
 //! Deterministic reply decision engine with persisted traces.
+mod coalesce;
+mod session;
+
 use crate::pipeline::InMessage;
 use serde_json::json;
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use sha2::{Digest, Sha256};
 
-static LAST_REPLY_AT: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+pub(crate) use coalesce::CoalescedMessage;
+
+const POLICY_VERSION: &str = "reply-v2-ewma";
+const MIN_AUTONOMOUS_SCORE: f32 = 32.0;
+const DIRECT_SCORE_THRESHOLD: f32 = 35.0;
 
 #[derive(Debug, Default, Clone)]
 pub struct ReplySignals {
@@ -15,9 +21,12 @@ pub struct ReplySignals {
     pub known_user: bool,
     pub intimacy: i32,
     pub recent_messages: i32,
+    pub sender_messages: i32,
+    pub activity_ewma: f32,
+    pub burst_penalty: f32,
+    pub recent_reply_penalty: f32,
     pub group_quiet: bool,
     pub emotional: bool,
-    pub just_replied: bool,
     pub is_spam: bool,
     pub too_frequent: bool,
     pub out_of_topic: bool,
@@ -32,17 +41,37 @@ pub struct ReplyDecision {
     pub direct: bool,
     pub should_reply: bool,
     pub reason: String,
+    pub p_rule: f32,
+    pub p_final: f32,
+    pub random_value: f32,
+}
+
+pub fn observe_message(msg: &InMessage) {
+    let alpha = crate::pipeline::current_config().decision.activity_alpha;
+    session::observe(msg, alpha);
+}
+
+pub async fn coalesce_message(msg: InMessage) -> Option<CoalescedMessage> {
+    let window_ms = crate::pipeline::current_config()
+        .decision
+        .coalesce_window_ms;
+    coalesce::coalesce(msg, window_ms).await
+}
+
+pub fn clear_runtime_state() {
+    coalesce::clear();
 }
 
 /// 判断是否回复，并将结果写入 decision_traces。
-pub async fn should_reply(msg: &InMessage) -> bool {
+pub async fn should_reply(msg: &InMessage, coalesced_count: usize) -> bool {
     let decision = evaluate(msg);
-    persist_trace(msg, &decision);
+    persist_trace(msg, &decision, coalesced_count);
     log::trace!(
-        "[AliceBot] decision: event_key={}, score={:.1}, threshold={:.1}, direct={}, reply={}, reason={}",
+        "[AliceBot] decision: event_key={}, score={:.1}, p_final={:.3}, random={:.3}, direct={}, reply={}, reason={}",
         msg.event_key,
         decision.score,
-        decision.threshold,
+        decision.p_final,
+        decision.random_value,
         decision.direct,
         decision.should_reply,
         decision.reason
@@ -53,6 +82,7 @@ pub async fn should_reply(msg: &InMessage) -> bool {
 /// 纯函数式决策入口（数据库信号只读），适合离线回放和单元测试。
 pub fn evaluate(msg: &InMessage) -> ReplyDecision {
     let config = crate::pipeline::current_config();
+    let snapshot = session::load(msg);
     if msg.content.trim().is_empty() && !msg.has_media {
         return ReplyDecision {
             signals: ReplySignals::default(),
@@ -61,29 +91,48 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
             direct: false,
             should_reply: false,
             reason: "empty_message".to_string(),
+            p_rule: 0.0,
+            p_final: 0.0,
+            random_value: deterministic_random(&msg.event_key, POLICY_VERSION),
         };
     }
 
-    let signals = collect_signals(msg);
+    let signals = collect_signals(msg, &snapshot, &config);
     let direct = signals.mentioned || signals.is_question || signals.is_reply_to_me;
-    let threshold = if direct { 35.0 } else { 60.0 };
-    let score = score(&signals, config.behavior.reply_bias);
+    let threshold = if direct {
+        DIRECT_SCORE_THRESHOLD
+    } else {
+        MIN_AUTONOMOUS_SCORE
+    };
+    let score = score(&signals, config.reply_bias());
+    let p_rule = sigmoid((score - 50.0) / 12.0);
+    let prior_denominator = snapshot.reply_alpha + snapshot.reply_beta;
+    let participation_prior = if prior_denominator > 0.0 {
+        (snapshot.reply_alpha / prior_denominator).clamp(0.05, 0.95)
+    } else {
+        0.5
+    };
+    let p_final = (0.75 * p_rule + 0.25 * participation_prior).clamp(0.0, 1.0);
+    let random_value = deterministic_random(&msg.event_key, POLICY_VERSION);
     let (should_reply, reason) = if signals.is_spam {
         (false, "spam_detected")
     } else if signals.too_frequent {
         (false, "sender_burst")
     } else if !msg.at_me
-        && is_in_cooldown(
-            &msg.session_id,
-            msg.timestamp,
-            config.behavior.min_interval_sec,
-        )
+        && !signals.is_reply_to_me
+        && is_in_cooldown(&snapshot, msg.timestamp, config.min_interval_sec())
     {
         (false, "session_cooldown")
-    } else if score >= threshold {
-        (true, "score_reached")
+    } else if !config.decision.enabled && !direct {
+        (false, "autonomous_disabled")
+    } else if direct {
+        (true, "direct_signal")
+    } else if score < MIN_AUTONOMOUS_SCORE {
+        (false, "below_minimum_score")
+    } else if random_value <= p_final {
+        (true, "sampled_reply")
     } else {
-        (false, "below_threshold")
+        (false, "sampled_skip")
     };
 
     ReplyDecision {
@@ -93,19 +142,54 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
         direct,
         should_reply,
         reason: reason.to_string(),
+        p_rule,
+        p_final,
+        random_value,
     }
 }
 
-pub fn record_reply(session_id: &str, timestamp: i64) {
-    if let Ok(mut state) = LAST_REPLY_AT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
+pub fn record_reply(msg: &InMessage, timestamp: i64) {
+    session::record_outbound(msg, timestamp);
+}
+
+pub fn record_coalesced(batch: &CoalescedMessage) {
+    let Some(database) = crate::pipeline::try_db() else {
+        return;
+    };
+    let signals_json = json!({
+        "coalesced_into": batch.message.event_key,
+        "policy_version": POLICY_VERSION,
+    })
+    .to_string();
+    for event_key in batch
+        .source_event_keys
+        .iter()
+        .filter(|event_key| *event_key != &batch.message.event_key)
     {
-        state.insert(session_id.to_string(), timestamp);
+        let trace = crate::db::DecisionTrace {
+            event_key,
+            session_id: &batch.message.session_id,
+            policy_version: POLICY_VERSION,
+            score: 0.0,
+            threshold: 0.0,
+            p_rule: 0.0,
+            p_final: 0.0,
+            random_value: deterministic_random(event_key, POLICY_VERSION),
+            activity_ewma: 0.0,
+            direct: false,
+            outcome: "batch",
+            reason: "coalesced_into_later_message",
+            signals_json: &signals_json,
+            coalesced_count: batch.source_event_keys.len(),
+            created_at: batch.message.timestamp,
+        };
+        if let Err(error) = database.insert_decision_trace(&trace) {
+            log::debug!("[AliceBot] coalesced decision trace write failed: {error}");
+        }
     }
 }
 
-fn persist_trace(msg: &InMessage, decision: &ReplyDecision) {
+fn persist_trace(msg: &InMessage, decision: &ReplyDecision, coalesced_count: usize) {
     let Some(database) = crate::pipeline::try_db() else {
         return;
     };
@@ -117,6 +201,10 @@ fn persist_trace(msg: &InMessage, decision: &ReplyDecision) {
         "known_user": decision.signals.known_user,
         "intimacy": decision.signals.intimacy,
         "recent_messages": decision.signals.recent_messages,
+        "sender_messages": decision.signals.sender_messages,
+        "activity_ewma": decision.signals.activity_ewma,
+        "burst_penalty": decision.signals.burst_penalty,
+        "recent_reply_penalty": decision.signals.recent_reply_penalty,
         "group_quiet": decision.signals.group_quiet,
         "emotional": decision.signals.emotional,
         "is_spam": decision.signals.is_spam,
@@ -125,38 +213,44 @@ fn persist_trace(msg: &InMessage, decision: &ReplyDecision) {
         "has_media": decision.signals.has_media,
     })
     .to_string();
-    if let Err(error) = database.insert_decision_trace(
-        &msg.event_key,
-        &msg.session_id,
-        decision.score,
-        decision.threshold,
-        decision.direct,
-        if decision.should_reply {
+    let trace = crate::db::DecisionTrace {
+        event_key: &msg.event_key,
+        session_id: &msg.session_id,
+        policy_version: POLICY_VERSION,
+        score: decision.score,
+        threshold: decision.threshold,
+        p_rule: decision.p_rule,
+        p_final: decision.p_final,
+        random_value: decision.random_value,
+        activity_ewma: decision.signals.activity_ewma,
+        direct: decision.direct,
+        outcome: if decision.should_reply {
             "reply"
         } else {
             "skip"
         },
-        &decision.reason,
-        &signals_json,
-        msg.timestamp,
-    ) {
+        reason: &decision.reason,
+        signals_json: &signals_json,
+        coalesced_count,
+        created_at: msg.timestamp,
+    };
+    if let Err(error) = database.insert_decision_trace(&trace) {
         log::debug!("[AliceBot] decision trace 写入失败: {error}");
     }
 }
 
-fn is_in_cooldown(session_id: &str, now: i64, interval_sec: u64) -> bool {
-    let Some(last) = LAST_REPLY_AT
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .ok()
-        .and_then(|state| state.get(session_id).copied())
-    else {
+fn is_in_cooldown(snapshot: &session::SessionSnapshot, now: i64, interval_sec: u64) -> bool {
+    let Some(last) = snapshot.last_outbound_at else {
         return false;
     };
     now.saturating_sub(last) < (interval_sec as i64).saturating_mul(1_000)
 }
 
-fn collect_signals(msg: &InMessage) -> ReplySignals {
+fn collect_signals(
+    msg: &InMessage,
+    snapshot: &session::SessionSnapshot,
+    config: &crate::config::AppConfig,
+) -> ReplySignals {
     let database = crate::pipeline::try_db();
     let (known_user, intimacy) = database
         .as_ref()
@@ -172,26 +266,32 @@ fn collect_signals(msg: &InMessage) -> ReplySignals {
         })
         .unwrap_or((false, 0));
 
-    let (recent_messages, sender_messages) = database
-        .as_ref()
-        .and_then(|database| {
-            let connection = database.conn.lock().ok()?;
-            let window_start = msg.timestamp.saturating_sub(60_000);
-            connection
-                .query_row(
-                    "SELECT
-                         (SELECT COUNT(*) FROM messages
-                          WHERE session_id = ?1 AND direction = 'inbound' AND created_at >= ?2),
-                         (SELECT COUNT(*) FROM messages
-                          WHERE session_id = ?1 AND sender_id = ?3 AND direction = 'inbound'
-                            AND created_at >= ?4)",
-                    rusqlite::params![msg.session_id, window_start, msg.sender_id, window_start],
-                    |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)?)),
-                )
-                .ok()
+    let quiet_threshold = config.decision.quiet_threshold.clamp(0.0, 1.0);
+    let configured_burst = config.decision.burst_threshold.clamp(0.0, 1.0);
+    let burst_threshold = if configured_burst <= quiet_threshold {
+        (quiet_threshold + 0.1).min(1.0)
+    } else {
+        configured_burst
+    };
+    let burst_penalty = if snapshot.activity_ewma <= burst_threshold {
+        0.0
+    } else if burst_threshold >= 1.0 {
+        1.0
+    } else {
+        ((snapshot.activity_ewma - burst_threshold) / (1.0 - burst_threshold)).clamp(0.0, 1.0)
+    };
+    let recent_reply_penalty = snapshot
+        .last_outbound_at
+        .map(|last| {
+            let age = msg.timestamp.saturating_sub(last);
+            let interval_ms = (config.min_interval_sec() as i64).saturating_mul(1_000);
+            if age >= interval_ms || interval_ms == 0 {
+                (snapshot.recent_outbound_count as f32 / 5.0).clamp(0.0, 0.6)
+            } else {
+                (1.0 - age as f32 / interval_ms as f32).clamp(0.0, 1.0)
+            }
         })
-        .unwrap_or((0, 0));
-
+        .unwrap_or(0.0);
     let content = msg.content.trim();
     ReplySignals {
         mentioned: msg.at_me,
@@ -200,12 +300,15 @@ fn collect_signals(msg: &InMessage) -> ReplySignals {
         topic_hit: false,
         known_user,
         intimacy,
-        recent_messages,
-        group_quiet: recent_messages <= 2,
+        recent_messages: snapshot.recent_messages,
+        sender_messages: snapshot.sender_messages,
+        activity_ewma: snapshot.activity_ewma,
+        burst_penalty,
+        recent_reply_penalty,
+        group_quiet: snapshot.activity_ewma <= quiet_threshold,
         emotional: looks_emotional(content),
-        just_replied: false,
         is_spam: looks_like_spam(content),
-        too_frequent: sender_messages >= 4,
+        too_frequent: snapshot.sender_messages >= 5,
         out_of_topic: false,
         has_media: msg.has_media,
     }
@@ -295,19 +398,15 @@ pub fn score(signals: &ReplySignals, reply_bias: f32) -> f32 {
     score += (signals.intimacy as f32 / 100.0).clamp(0.0, 1.0) * 12.0;
     if signals.group_quiet {
         score += 12.0;
-    } else if signals.recent_messages >= 8 {
-        // 群消息越密集，越避免插入无关回复；直接提问仍由较低阈值保证优先。
-        score -= ((signals.recent_messages - 7) as f32 * 2.0).min(20.0);
     }
+    score -= signals.burst_penalty.clamp(0.0, 1.0) * 26.0;
     if signals.has_media {
         score += 4.0;
     }
     if signals.emotional {
         score += 10.0;
     }
-    if signals.just_replied {
-        score -= 24.0;
-    }
+    score -= signals.recent_reply_penalty.clamp(0.0, 1.0) * 24.0;
     if signals.is_spam {
         score -= 55.0;
     }
@@ -318,6 +417,25 @@ pub fn score(signals: &ReplySignals, reply_bias: f32) -> f32 {
         score -= 18.0;
     }
     (score + reply_bias.clamp(0.0, 1.0) * 20.0).clamp(0.0, 100.0)
+}
+
+fn sigmoid(value: f32) -> f32 {
+    (1.0 / (1.0 + (-value).exp())).clamp(0.0, 1.0)
+}
+
+fn deterministic_random(event_key: &str, policy_version: &str) -> f32 {
+    let mut hasher = Sha256::new();
+    hasher.update(event_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(policy_version.as_bytes());
+    let digest = hasher.finalize();
+    let value = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    );
+    let mantissa = value >> 11;
+    (mantissa as f64 / (1_u64 << 53) as f64) as f32
 }
 
 #[cfg(test)]
@@ -365,6 +483,8 @@ mod tests {
     fn busy_group_is_penalized_but_direct_question_stays_strong() {
         let busy = ReplySignals {
             recent_messages: 15,
+            activity_ewma: 0.95,
+            burst_penalty: 0.67,
             group_quiet: false,
             ..ReplySignals::default()
         };
@@ -372,6 +492,8 @@ mod tests {
             is_question: true,
             mentioned: true,
             recent_messages: 15,
+            activity_ewma: 0.95,
+            burst_penalty: 0.67,
             group_quiet: false,
             ..ReplySignals::default()
         };
@@ -384,5 +506,20 @@ mod tests {
         let result = evaluate(&message(""));
         assert!(!result.should_reply);
         assert_eq!(result.reason, "empty_message");
+    }
+
+    #[test]
+    fn deterministic_random_is_stable_and_policy_scoped() {
+        let first = deterministic_random("event-1", "policy-a");
+        assert_eq!(first, deterministic_random("event-1", "policy-a"));
+        assert_ne!(first, deterministic_random("event-1", "policy-b"));
+        assert!((0.0..1.0).contains(&first));
+    }
+
+    #[test]
+    fn sigmoid_probability_is_bounded_and_monotonic() {
+        assert!(sigmoid(-2.0) < sigmoid(0.0));
+        assert!(sigmoid(0.0) < sigmoid(2.0));
+        assert_eq!(sigmoid(0.0), 0.5);
     }
 }

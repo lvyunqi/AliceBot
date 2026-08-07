@@ -149,6 +149,7 @@ pub async fn handle_message(event: NoticeEvent) {
         }
     }
 
+    decision::observe_message(&msg);
     memory::observe_user(&msg).await;
     memory::push_short_context(&msg).await;
 
@@ -174,7 +175,14 @@ pub async fn handle_message(event: NoticeEvent) {
         }
     }
 
-    if !decision::should_reply(&msg).await {
+    let Some(batch) = decision::coalesce_message(msg).await else {
+        return;
+    };
+    decision::record_coalesced(&batch);
+    let coalesced_count = batch.source_event_keys.len();
+    let msg = batch.message;
+
+    if !decision::should_reply(&msg, coalesced_count).await {
         log::trace!("[AliceBot] 决定不回复，event_key={}", msg.event_key);
         return;
     }
@@ -199,7 +207,7 @@ pub async fn handle_message(event: NoticeEvent) {
     {
         let sent_at = chrono::Utc::now().timestamp_millis();
         memory::push_assistant_context(&msg.session_id, &reply, sent_at).await;
-        decision::record_reply(&msg.session_id, sent_at);
+        decision::record_reply(&msg, sent_at);
 
         let config = current_config();
         if config.stickers.enabled
@@ -674,6 +682,13 @@ pub async fn get_status() -> String {
                 .query_row(sql, [], |row| row.get::<_, i64>(0))
                 .unwrap_or(-1)
         };
+        let average_activity = connection
+            .query_row(
+                "SELECT COALESCE(AVG(activity_ewma), 0) FROM session_state",
+                [],
+                |row| row.get::<_, f64>(0),
+            )
+            .unwrap_or(-1.0);
         Some((
             count("SELECT COUNT(*) FROM messages"),
             count("SELECT COUNT(*) FROM llm_calls WHERE status = 'success'"),
@@ -681,6 +696,9 @@ pub async fn get_status() -> String {
             count("SELECT COUNT(*) FROM outbound_messages WHERE status = 'accepted'"),
             count("SELECT COUNT(*) FROM outbound_messages WHERE status IN ('rejected', 'invalid')"),
             count("SELECT COUNT(*) FROM decision_traces WHERE outcome = 'reply'"),
+            count("SELECT COUNT(*) FROM decision_traces WHERE outcome = 'batch'"),
+            count("SELECT COUNT(*) FROM session_state"),
+            average_activity,
             count("SELECT COUNT(*) FROM compaction_runs WHERE status = 'completed'"),
         ))
     });
@@ -691,8 +709,11 @@ pub async fn get_status() -> String {
         outbound_accepted,
         outbound_failures,
         decision_replies,
+        decision_batches,
+        active_sessions,
+        average_activity,
         compactions,
-    ) = metrics.unwrap_or((-1, -1, -1, -1, -1, -1, -1));
+    ) = metrics.unwrap_or((-1, -1, -1, -1, -1, -1, -1, -1, -1.0, -1));
 
     json!({
         "status": "running",
@@ -702,6 +723,9 @@ pub async fn get_status() -> String {
         "outbound_accepted": outbound_accepted,
         "outbound_failures": outbound_failures,
         "decision_replies": decision_replies,
+        "decision_batches": decision_batches,
+        "active_sessions": active_sessions,
+        "average_activity": average_activity,
         "compactions": compactions,
         "version": env!("CARGO_PKG_VERSION"),
     })

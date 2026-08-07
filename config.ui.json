@@ -44,11 +44,7 @@
       }
     },
     "behavior": {
-      "ui:order": ["reply_bias", "temperature", "max_tokens", "max_context_tokens", "min_interval_sec", "allow_typos", "emoji_usage"],
-      "reply_bias": {
-        "ui:widget": "slider",
-        "unit": ""
-      },
+      "ui:order": ["temperature", "max_tokens", "max_context_tokens", "allow_typos", "emoji_usage"],
       "temperature": {
         "ui:widget": "slider",
         "unit": ""
@@ -62,9 +58,27 @@
       },
       "max_context_tokens": {
         "unit": "tokens"
+      }
+    },
+    "decision": {
+      "ui:order": ["enabled", "reply_bias", "min_interval_sec", "coalesce_window_ms", "activity_alpha", "quiet_threshold", "burst_threshold"],
+      "reply_bias": {
+        "ui:widget": "slider"
       },
       "min_interval_sec": {
         "unit": "秒"
+      },
+      "coalesce_window_ms": {
+        "unit": "毫秒"
+      },
+      "activity_alpha": {
+        "ui:widget": "slider"
+      },
+      "quiet_threshold": {
+        "ui:widget": "slider"
+      },
+      "burst_threshold": {
+        "ui:widget": "slider"
       }
     },
     "memories": {

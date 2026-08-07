@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 5;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DatabaseError {
@@ -120,6 +120,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
             migration_3_compaction(transaction)?;
             migration_4_llm_audit(transaction)?;
         }
+        6 => migration_6_session_state(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -358,6 +359,42 @@ fn migration_4_llm_audit(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+fn migration_6_session_state(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS session_state (
+            session_key           TEXT PRIMARY KEY,
+            protocol              TEXT NOT NULL,
+            session_type          TEXT NOT NULL,
+            session_id            TEXT NOT NULL,
+            last_message_at       INTEGER,
+            last_outbound_at      INTEGER,
+            recent_outbound_count INTEGER NOT NULL DEFAULT 0,
+            activity_ewma         REAL NOT NULL DEFAULT 0,
+            short_summary         TEXT,
+            short_cursor          INTEGER NOT NULL DEFAULT 0,
+            reply_alpha           REAL NOT NULL DEFAULT 1,
+            reply_beta            REAL NOT NULL DEFAULT 1,
+            updated_at            INTEGER NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_session_state_route
+            ON session_state(protocol, session_type, session_id);
+        "#,
+    )?;
+    ensure_column(conn, "decision_traces", "policy_version", "TEXT")?;
+    ensure_column(conn, "decision_traces", "p_rule", "REAL")?;
+    ensure_column(conn, "decision_traces", "p_final", "REAL")?;
+    ensure_column(conn, "decision_traces", "random_value", "REAL")?;
+    ensure_column(conn, "decision_traces", "activity_ewma", "REAL")?;
+    ensure_column(
+        conn,
+        "decision_traces",
+        "coalesced_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -397,7 +434,17 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         ),
         (
             "decision_traces",
-            &["event_key", "signals_json", "outcome"][..],
+            &[
+                "event_key",
+                "signals_json",
+                "outcome",
+                "policy_version",
+                "p_rule",
+                "p_final",
+                "random_value",
+                "activity_ewma",
+                "coalesced_count",
+            ][..],
         ),
         (
             "llm_calls",
@@ -406,6 +453,17 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         (
             "compaction_runs",
             &["run_key", "cursor_start", "status"][..],
+        ),
+        (
+            "session_state",
+            &[
+                "session_key",
+                "last_message_at",
+                "last_outbound_at",
+                "activity_ewma",
+                "reply_alpha",
+                "reply_beta",
+            ][..],
         ),
         ("long_memory", &["content", "importance", "is_active"][..]),
         ("personas", &["subject_id", "nickname", "intimacy"][..]),
@@ -444,6 +502,7 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_decision_outcome_time",
         "idx_llm_calls_status_time",
         "idx_compaction_status_time",
+        "ux_session_state_route",
     ];
     for index in required_indexes {
         if !object_exists(conn, "index", index)? {
@@ -573,8 +632,8 @@ mod tests {
         let temporary = TempDatabase::new("new");
         let database = Database::open(temporary.as_str()).expect("new database should open");
         assert_eq!(
-            database.get_meta("schema_version").unwrap().as_deref(),
-            Some("5")
+            database.get_meta("schema_version").unwrap(),
+            Some(LATEST_SCHEMA_VERSION.to_string())
         );
         drop(database);
         assert!(temporary.backups().is_empty());
@@ -639,8 +698,8 @@ mod tests {
 
         let database = Database::open(temporary.as_str()).expect("version four should migrate");
         assert_eq!(
-            database.get_meta("schema_version").unwrap().as_deref(),
-            Some("5")
+            database.get_meta("schema_version").unwrap(),
+            Some(LATEST_SCHEMA_VERSION.to_string())
         );
         let interaction_count: i64 = database
             .conn
@@ -664,6 +723,28 @@ mod tests {
         let reopened = Database::open(temporary.as_str()).expect("latest database should reopen");
         drop(reopened);
         assert_eq!(temporary.backups().len(), 1);
+    }
+
+    #[test]
+    fn version_five_database_gains_session_state_and_probability_trace_columns() {
+        let temporary = TempDatabase::new("version-five");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 5).unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version five should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(object_exists(&connection, "table", "session_state").unwrap());
+        assert!(column_exists(&connection, "decision_traces", "p_final").unwrap());
+        assert!(column_exists(&connection, "decision_traces", "random_value").unwrap());
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 5);
+        assert!(!object_exists(&backup, "table", "session_state").unwrap());
     }
 
     #[test]
@@ -707,16 +788,19 @@ mod tests {
             Ok(_) => panic!("newer schema should fail"),
             Err(error) => error,
         };
-        assert!(matches!(
-            error,
-            DatabaseError::SchemaTooNew {
-                found: 6,
-                supported: 5
+        match error {
+            DatabaseError::SchemaTooNew { found, supported } => {
+                assert_eq!(found, LATEST_SCHEMA_VERSION + 1);
+                assert_eq!(supported, LATEST_SCHEMA_VERSION);
             }
-        ));
+            other => panic!("unexpected error: {other}"),
+        }
         assert!(temporary.backups().is_empty());
 
         let connection = Connection::open(&temporary.path).unwrap();
-        assert_eq!(read_schema_version(&connection).unwrap(), 6);
+        assert_eq!(
+            read_schema_version(&connection).unwrap(),
+            LATEST_SCHEMA_VERSION + 1
+        );
     }
 }

@@ -29,6 +29,24 @@ pub struct OutboundAttempt {
     pub media_url: Option<String>,
 }
 
+pub struct DecisionTrace<'a> {
+    pub event_key: &'a str,
+    pub session_id: &'a str,
+    pub policy_version: &'a str,
+    pub score: f32,
+    pub threshold: f32,
+    pub p_rule: f32,
+    pub p_final: f32,
+    pub random_value: f32,
+    pub activity_ewma: f32,
+    pub direct: bool,
+    pub outcome: &'a str,
+    pub reason: &'a str,
+    pub signals_json: &'a str,
+    pub coalesced_count: usize,
+    pub created_at: i64,
+}
+
 impl Database {
     /// 打开/创建数据库
     pub fn open(path: &str) -> Result<Self, DatabaseError> {
@@ -147,33 +165,30 @@ impl Database {
     }
 
     /// 写入一条幂等决策 trace。
-    pub fn insert_decision_trace(
-        &self,
-        event_key: &str,
-        session_id: &str,
-        score: f32,
-        threshold: f32,
-        direct: bool,
-        outcome: &str,
-        reason: &str,
-        signals_json: &str,
-        created_at: i64,
-    ) -> Result<(), rusqlite::Error> {
+    pub fn insert_decision_trace(&self, trace: &DecisionTrace<'_>) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO decision_traces
-             (event_key, session_id, score, threshold, direct, outcome, reason, signals_json, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (event_key, session_id, policy_version, score, threshold, p_rule, p_final,
+              random_value, activity_ewma, direct, outcome, reason, signals_json,
+              coalesced_count, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
-                event_key,
-                session_id,
-                score,
-                threshold,
-                direct as i32,
-                outcome,
-                reason,
-                truncate_for_storage(signals_json),
-                created_at,
+                trace.event_key,
+                trace.session_id,
+                trace.policy_version,
+                trace.score,
+                trace.threshold,
+                trace.p_rule,
+                trace.p_final,
+                trace.random_value,
+                trace.activity_ewma,
+                trace.direct as i32,
+                trace.outcome,
+                trace.reason,
+                truncate_for_storage(trace.signals_json),
+                trace.coalesced_count.min(i64::MAX as usize) as i64,
+                trace.created_at,
             ],
         )?;
         Ok(())
@@ -482,43 +497,68 @@ mod tests {
         let database = Database::open(path.to_str().expect("temporary path is not UTF-8"))
             .expect("database should open");
         database
-            .insert_decision_trace(
-                "event-1",
-                "group-1",
-                61.5,
-                60.0,
-                false,
-                "reply",
-                "score_reached",
-                r#"{"question":true}"#,
-                10,
-            )
+            .insert_decision_trace(&DecisionTrace {
+                event_key: "event-1",
+                session_id: "group-1",
+                policy_version: "test-v1",
+                score: 61.5,
+                threshold: 60.0,
+                p_rule: 0.72,
+                p_final: 0.66,
+                random_value: 0.2,
+                activity_ewma: 0.3,
+                direct: false,
+                outcome: "reply",
+                reason: "score_reached",
+                signals_json: r#"{"question":true}"#,
+                coalesced_count: 1,
+                created_at: 10,
+            })
             .expect("trace should insert");
         database
-            .insert_decision_trace(
-                "event-1",
-                "group-1",
-                0.0,
-                60.0,
-                false,
-                "skip",
-                "duplicate",
-                "{}",
-                11,
-            )
+            .insert_decision_trace(&DecisionTrace {
+                event_key: "event-1",
+                session_id: "group-1",
+                policy_version: "test-v1",
+                score: 0.0,
+                threshold: 60.0,
+                p_rule: 0.0,
+                p_final: 0.0,
+                random_value: 0.5,
+                activity_ewma: 0.0,
+                direct: false,
+                outcome: "skip",
+                reason: "duplicate",
+                signals_json: "{}",
+                coalesced_count: 1,
+                created_at: 11,
+            })
             .expect("duplicate trace should be ignored");
 
         let connection = database.conn.lock().expect("database lock should work");
-        let row: (i64, String, f64) = connection
+        let row: (i64, String, f64, String, f64, i64) = connection
             .query_row(
-                "SELECT COUNT(*), outcome, score FROM decision_traces WHERE event_key = 'event-1'",
+                "SELECT COUNT(*), outcome, score, policy_version, p_final, coalesced_count
+                 FROM decision_traces WHERE event_key = 'event-1'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
             )
             .expect("trace should exist");
         assert_eq!(row.0, 1);
         assert_eq!(row.1, "reply");
         assert_eq!(row.2, 61.5);
+        assert_eq!(row.3, "test-v1");
+        assert!((row.4 - 0.66).abs() < 0.000_01);
+        assert_eq!(row.5, 1);
 
         drop(connection);
         drop(database);

@@ -4,9 +4,10 @@
 //! API 0.6 的 Schema 校验由宿主完成，这里只做 Rust 层反序列化。
 
 use serde::Deserialize;
+use std::collections::HashSet;
 
 /// 应用配置（完整）
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub persona: PersonaConfig,
@@ -18,6 +19,9 @@ pub struct AppConfig {
     pub behavior: BehaviorConfig,
 
     #[serde(default)]
+    pub decision: DecisionConfig,
+
+    #[serde(default)]
     pub memories: MemoryConfig,
 
     #[serde(default)]
@@ -27,16 +31,19 @@ pub struct AppConfig {
     pub send: SendConfig,
 }
 
-impl Default for AppConfig {
-    fn default() -> Self {
-        Self {
-            persona: PersonaConfig::default(),
-            llm: LlmConfig::default(),
-            behavior: BehaviorConfig::default(),
-            memories: MemoryConfig::default(),
-            stickers: StickerConfig::default(),
-            send: SendConfig::default(),
-        }
+impl AppConfig {
+    pub fn reply_bias(&self) -> f32 {
+        self.decision
+            .reply_bias
+            .unwrap_or(self.behavior.reply_bias)
+            .clamp(0.0, 1.0)
+    }
+
+    pub fn min_interval_sec(&self) -> u64 {
+        self.decision
+            .min_interval_sec
+            .unwrap_or(self.behavior.min_interval_sec)
+            .clamp(1, 300)
     }
 }
 
@@ -218,6 +225,62 @@ impl Default for BehaviorConfig {
     }
 }
 
+/// Autonomous reply policy. Optional probability/cooldown fields fall back to
+/// their legacy `behavior` locations for one configuration version.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DecisionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    #[serde(default)]
+    pub reply_bias: Option<f32>,
+
+    #[serde(default)]
+    pub min_interval_sec: Option<u64>,
+
+    #[serde(default = "default_coalesce_window_ms")]
+    pub coalesce_window_ms: u64,
+
+    #[serde(default = "default_activity_alpha")]
+    pub activity_alpha: f32,
+
+    #[serde(default = "default_quiet_threshold")]
+    pub quiet_threshold: f32,
+
+    #[serde(default = "default_burst_threshold")]
+    pub burst_threshold: f32,
+}
+
+fn default_coalesce_window_ms() -> u64 {
+    900
+}
+
+fn default_activity_alpha() -> f32 {
+    0.35
+}
+
+fn default_quiet_threshold() -> f32 {
+    0.25
+}
+
+fn default_burst_threshold() -> f32 {
+    0.85
+}
+
+impl Default for DecisionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reply_bias: None,
+            min_interval_sec: None,
+            coalesce_window_ms: default_coalesce_window_ms(),
+            activity_alpha: default_activity_alpha(),
+            quiet_threshold: default_quiet_threshold(),
+            burst_threshold: default_burst_threshold(),
+        }
+    }
+}
+
 /// 记忆策略
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryConfig {
@@ -320,4 +383,131 @@ pub fn parse_config(json: &str) -> Result<AppConfig, String> {
         return Ok(AppConfig::default());
     }
     serde_json::from_str::<AppConfig>(json).map_err(|e| format!("JSON 解析失败: {}", e))
+}
+
+pub fn parse_and_validate_config(json: &str) -> Result<AppConfig, String> {
+    let config = parse_config(json)?;
+    validate(&config)?;
+    Ok(config)
+}
+
+fn validate(config: &AppConfig) -> Result<(), String> {
+    let quiet = config.decision.quiet_threshold;
+    let burst = config.decision.burst_threshold;
+    if !(0.0..=1.0).contains(&quiet) || !(0.0..=1.0).contains(&burst) {
+        return Err("decision quiet/burst thresholds must be between 0 and 1".to_string());
+    }
+    if quiet >= burst {
+        return Err("decision.quiet_threshold must be lower than burst_threshold".to_string());
+    }
+    if !(0.05..=1.0).contains(&config.decision.activity_alpha) {
+        return Err("decision.activity_alpha must be between 0.05 and 1".to_string());
+    }
+    if config.decision.coalesce_window_ms > 3_000 {
+        return Err("decision.coalesce_window_ms cannot exceed 3000".to_string());
+    }
+
+    let mut provider_ids = HashSet::new();
+    for provider in &config.llm.providers {
+        let id = provider.id.trim();
+        if id.is_empty() {
+            return Err("LLM provider id cannot be empty".to_string());
+        }
+        if !provider_ids.insert(id) {
+            return Err(format!("duplicate LLM provider id: {id}"));
+        }
+        if !matches!(provider.protocol.as_str(), "openai" | "anthropic") {
+            return Err(format!(
+                "unsupported protocol for provider {id}: {}",
+                provider.protocol
+            ));
+        }
+        let url = reqwest::Url::parse(&provider.base_url)
+            .map_err(|_| format!("invalid base_url for provider {id}"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(format!(
+                "provider {id} base_url must be an absolute HTTP(S) URL"
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(format!(
+                "provider {id} base_url must not contain credentials"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_behavior_values_remain_effective() {
+        let config =
+            parse_and_validate_config(r#"{"behavior":{"reply_bias":0.2,"min_interval_sec":45}}"#)
+                .expect("legacy configuration should parse and validate");
+        assert_eq!(config.reply_bias(), 0.2);
+        assert_eq!(config.min_interval_sec(), 45);
+    }
+
+    #[test]
+    fn decision_values_override_legacy_locations() {
+        let config = parse_and_validate_config(
+            r#"{
+                "behavior":{"reply_bias":0.2,"min_interval_sec":45},
+                "decision":{"reply_bias":0.8,"min_interval_sec":9}
+            }"#,
+        )
+        .expect("new configuration should parse and validate");
+        assert_eq!(config.reply_bias(), 0.8);
+        assert_eq!(config.min_interval_sec(), 9);
+    }
+
+    #[test]
+    fn business_validation_rejects_threshold_inversion() {
+        let error = parse_and_validate_config(
+            r#"{"decision":{"quiet_threshold":0.9,"burst_threshold":0.4}}"#,
+        )
+        .expect_err("inverted thresholds should fail");
+        assert!(error.contains("quiet_threshold"));
+    }
+
+    #[test]
+    fn business_validation_rejects_duplicate_provider_ids() {
+        let error = parse_and_validate_config(
+            r#"{
+                "llm":{"providers":[
+                    {"id":"same","base_url":"https://example.com","protocol":"openai"},
+                    {"id":"same","base_url":"https://example.org","protocol":"anthropic"}
+                ]}
+            }"#,
+        )
+        .expect_err("duplicate provider IDs should fail");
+        assert!(error.contains("duplicate"));
+        assert!(!error.contains("api_key"));
+    }
+
+    #[test]
+    fn business_validation_rejects_non_http_provider_url_without_echoing_it() {
+        let error = parse_and_validate_config(
+            r#"{
+                "llm":{"providers":[
+                    {"id":"primary","base_url":"ftp://user:secret@example.com","protocol":"openai"}
+                ]}
+            }"#,
+        )
+        .expect_err("non-HTTP provider URL should fail");
+        assert!(error.contains("HTTP(S)"));
+        assert!(!error.contains("secret"));
+    }
+
+    #[test]
+    fn schema_exposes_decision_section_and_hides_legacy_fields() {
+        let schema: serde_json::Value = serde_json::from_str(include_str!("../config.schema.json"))
+            .expect("configuration schema should be valid JSON");
+        assert!(schema["properties"]["decision"].is_object());
+        assert!(schema["properties"]["behavior"]["properties"]["reply_bias"].is_null());
+        assert!(schema["properties"]["behavior"]["properties"]["min_interval_sec"].is_null());
+    }
 }

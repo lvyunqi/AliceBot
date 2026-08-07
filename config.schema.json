@@ -141,14 +141,6 @@
       "title": "拟人行为",
       "description": "控制 AI 的行为参数",
       "properties": {
-        "reply_bias": {
-          "type": "number",
-          "title": "回复倾向",
-          "description": "全局回复概率 0-1，越高越爱说话",
-          "minimum": 0,
-          "maximum": 1,
-          "default": 0.5
-        },
         "temperature": {
           "type": "number",
           "title": "创造性",
@@ -173,14 +165,6 @@
           "maximum": 32000,
           "default": 4000
         },
-        "min_interval_sec": {
-          "type": "integer",
-          "title": "最小回复间隔(秒)",
-          "description": "同会话内两条主动回复的最小间隔",
-          "minimum": 1,
-          "maximum": 300,
-          "default": 15
-        },
         "allow_typos": {
           "type": "boolean",
           "title": "允许语句错误",
@@ -194,6 +178,67 @@
           "minimum": 0,
           "maximum": 1,
           "default": 0.6
+        }
+      }
+    },
+    "decision": {
+      "type": "object",
+      "title": "自主决策",
+      "description": "控制回复概率、会话活跃度和连续消息合并",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "启用自主回复",
+          "description": "关闭后仅处理明确 @、平台回复、明确问题或紧急消息",
+          "default": true
+        },
+        "reply_bias": {
+          "type": "number",
+          "title": "回复倾向",
+          "description": "全局回复倾向 0-1，越高越愿意参与普通聊天",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.5
+        },
+        "min_interval_sec": {
+          "type": "integer",
+          "title": "最小回复间隔",
+          "description": "同一会话普通回复之间的最小间隔",
+          "minimum": 1,
+          "maximum": 300,
+          "default": 15
+        },
+        "coalesce_window_ms": {
+          "type": "integer",
+          "title": "连续消息合并窗口",
+          "description": "同一用户连续发言等待合并的时间；0 表示关闭",
+          "minimum": 0,
+          "maximum": 3000,
+          "default": 900
+        },
+        "activity_alpha": {
+          "type": "number",
+          "title": "活跃度更新速度",
+          "description": "EWMA 对最新消息间隔的权重",
+          "minimum": 0.05,
+          "maximum": 1,
+          "default": 0.35
+        },
+        "quiet_threshold": {
+          "type": "number",
+          "title": "安静阈值",
+          "description": "活跃度低于该值时提高参与意愿",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.25
+        },
+        "burst_threshold": {
+          "type": "number",
+          "title": "高峰阈值",
+          "description": "活跃度高于该值时逐步降低参与意愿",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.85
         }
       }
     },

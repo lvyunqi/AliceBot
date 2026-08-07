@@ -35,7 +35,7 @@ static RUNTIME: std::sync::LazyLock<runtime::PluginRuntime> =
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 1,
+    config_version = 2,
     config_apply = "reload"
 )]
 mod plugin {
@@ -48,7 +48,7 @@ mod plugin {
         log::info!("[AliceBot] 初始化...");
 
         // 解析配置
-        let cfg = match config::parse_config(config.config_json.as_str()) {
+        let cfg = match config::parse_and_validate_config(config.config_json.as_str()) {
             Ok(c) => c,
             Err(e) => {
                 log::error!("[AliceBot] 配置解析失败: {}", e);
@@ -101,6 +101,7 @@ mod plugin {
         log::info!("[AliceBot] 关闭...");
         let rt = &*RUNTIME;
         rt.shutdown();
+        decision::clear_runtime_state();
         pipeline::clear_db();
         pipeline::clear_config();
         log::info!("[AliceBot] 已关闭");
@@ -181,8 +182,11 @@ mod plugin {
 
     #[validate_config]
     fn validate(
-        _request: &abi_stable_host_api::PluginConfigRequest,
+        request: &abi_stable_host_api::PluginConfigRequest,
     ) -> abi_stable_host_api::PluginConfigResult {
-        abi_stable_host_api::PluginConfigResult::ok()
+        match config::parse_and_validate_config(request.config_json.as_str()) {
+            Ok(_) => abi_stable_host_api::PluginConfigResult::ok(),
+            Err(error) => abi_stable_host_api::PluginConfigResult::err(&error),
+        }
     }
 }
