@@ -14,6 +14,7 @@ use qimen_dynamic_plugin_derive::dynamic_plugin;
 mod config;
 mod db;
 mod decision;
+mod media;
 mod pipeline;
 mod runtime;
 mod send;

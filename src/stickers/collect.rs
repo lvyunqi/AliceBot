@@ -17,22 +17,30 @@ pub async fn maybe_collect_with_metadata(
     source_session: &str,
     probability: f32,
 ) -> Option<i64> {
-    if !image_url.starts_with("https://") || probability <= 0.0 {
+    let media = crate::media::sanitize_remote_media_url(image_url, true)?;
+    if probability <= 0.0 {
         return None;
     }
-    if probability < 1.0 && deterministic_sample(image_url) >= probability.clamp(0.0, 1.0) {
+    if probability < 1.0
+        && deterministic_sample(&media.identity_hash) >= probability.clamp(0.0, 1.0)
+    {
         return None;
     }
 
     let database = crate::pipeline::try_db()?;
     let now = chrono::Utc::now().timestamp_millis();
-    let file_hash = hash_url(image_url);
+    let requires_cache = i32::from(media.requires_cache);
+    let cache_status = if media.requires_cache {
+        "required"
+    } else {
+        "remote"
+    };
     let sticker_id = {
         let connection = database.conn.lock().ok()?;
         let existing = connection
             .query_row(
-                "SELECT id FROM stickers WHERE file_hash = ?1 LIMIT 1",
-                rusqlite::params![file_hash],
+                "SELECT id FROM stickers WHERE url_hash = ?1 LIMIT 1",
+                rusqlite::params![media.identity_hash],
                 |row| row.get::<_, i64>(0),
             )
             .ok();
@@ -40,9 +48,15 @@ pub async fn maybe_collect_with_metadata(
             connection
                 .execute(
                     "UPDATE stickers
-                     SET usage_count = usage_count + 1, last_used = ?1
-                     WHERE id = ?2",
-                    rusqlite::params![now, id],
+                     SET usage_count = usage_count + 1, last_used = ?1, updated_at = ?1,
+                         media_url = CASE
+                             WHEN url_requires_cache = 1 AND ?2 = 0 THEN ?3
+                             ELSE media_url
+                         END,
+                         url_requires_cache = MIN(url_requires_cache, ?2),
+                         cache_status = CASE WHEN ?2 = 0 THEN 'remote' ELSE cache_status END
+                     WHERE id = ?4",
+                    rusqlite::params![now, requires_cache, media.storage_url, id],
                 )
                 .ok()?;
             id
@@ -50,13 +64,15 @@ pub async fn maybe_collect_with_metadata(
             connection
                 .execute(
                     "INSERT INTO stickers
-                     (protocol, kind, media_url, file_hash, source_user, source_session,
-                      usage_count, last_used, created_at)
-                     VALUES (?1, 'image', ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+                     (protocol, kind, media_url, url_hash, url_requires_cache, cache_status,
+                      source_user, source_session, usage_count, last_used, created_at, updated_at)
+                     VALUES (?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?8)",
                     rusqlite::params![
                         protocol,
-                        image_url,
-                        file_hash,
+                        media.storage_url,
+                        media.identity_hash,
+                        requires_cache,
+                        cache_status,
                         source_user,
                         source_session,
                         now
@@ -87,39 +103,6 @@ pub fn deterministic_sample(value: &str) -> f32 {
     u64::from_le_bytes(bytes) as f64 as f32 / u64::MAX as f32
 }
 
-fn hash_url(url: &str) -> String {
-    let digest = Sha256::digest(canonical_url(url).as_bytes());
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn canonical_url(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
-    };
-    let stable_query = query
-        .split('&')
-        .filter(|part| {
-            let key = part
-                .split('=')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            !(key.contains("token")
-                || key.contains("secret")
-                || key.contains("rkey")
-                || key.contains("signature")
-                || key == "sig"
-                || key == "auth"
-                || key.ends_with("_key"))
-        })
-        .collect::<Vec<_>>();
-    if stable_query.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", stable_query.join("&"))
-    }
-}
-
 fn tags_from_context(context: &str) -> Vec<String> {
     let known_tags = [
         "开心", "难过", "生气", "哈哈", "无语", "震惊", "可爱", "猫", "狗", "谢谢", "恭喜", "问号",
@@ -148,11 +131,28 @@ mod tests {
 
     #[test]
     fn invalid_media_is_not_collected() {
-        assert_eq!(hash_url("http://example.test/a.png").len(), 64);
         assert!(tags_from_context("今天哈哈开心").contains(&"哈哈".to_string()));
+        assert!(
+            crate::media::sanitize_remote_media_url("http://example.test/a.png", true).is_none()
+        );
+    }
+
+    #[test]
+    fn credential_rotation_keeps_collection_sampling_stable() {
+        let first = crate::media::sanitize_remote_media_url(
+            "https://example.test/a.png?fileid=1&rkey=old",
+            true,
+        )
+        .unwrap();
+        let second = crate::media::sanitize_remote_media_url(
+            "https://example.test/a.png?rkey=new&fileid=1",
+            true,
+        )
+        .unwrap();
+        assert_eq!(first.identity_hash, second.identity_hash);
         assert_eq!(
-            hash_url("https://example.test/a.png?fileid=1&rkey=old"),
-            hash_url("https://example.test/a.png?fileid=1&rkey=new")
+            deterministic_sample(&first.identity_hash),
+            deterministic_sample(&second.identity_hash)
         );
     }
 }

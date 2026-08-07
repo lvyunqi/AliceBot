@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 13;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 14;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -129,6 +129,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         11 => migration_11_memory_route_isolation(transaction)?,
         12 => migration_12_short_context_recovery_indexes(transaction)?,
         13 => migration_13_behavior_calibration(transaction)?,
+        14 => migration_14_media_url_privacy(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -867,6 +868,108 @@ fn migration_13_behavior_calibration(conn: &Connection) -> Result<(), rusqlite::
     Ok(())
 }
 
+fn migration_14_media_url_privacy(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(conn, "stickers", "url_hash", "TEXT")?;
+    ensure_column(
+        conn,
+        "stickers",
+        "url_requires_cache",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "stickers",
+        "cache_status",
+        "TEXT NOT NULL DEFAULT 'url_only'",
+    )?;
+    ensure_column(conn, "stickers", "updated_at", "INTEGER NOT NULL DEFAULT 0")?;
+
+    sanitize_media_url_column(conn, "messages")?;
+    sanitize_media_url_column(conn, "outbound_messages")?;
+
+    let stickers = {
+        let mut statement = conn.prepare(
+            "SELECT id, media_url, file_hash, created_at
+             FROM stickers ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (id, raw_url, legacy_url_hash, created_at) in stickers {
+        match crate::media::sanitize_remote_media_url(&raw_url, true) {
+            Some(media) => {
+                let status = if media.requires_cache {
+                    "required"
+                } else {
+                    "remote"
+                };
+                conn.execute(
+                    "UPDATE stickers
+                     SET media_url = ?1, url_hash = ?2, file_hash = NULL,
+                         url_requires_cache = ?3, cache_status = ?4,
+                         updated_at = CASE WHEN updated_at = 0 THEN ?5 ELSE updated_at END
+                     WHERE id = ?6",
+                    rusqlite::params![
+                        media.storage_url,
+                        media.identity_hash,
+                        i32::from(media.requires_cache),
+                        status,
+                        created_at,
+                        id,
+                    ],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE stickers
+                     SET media_url = '[invalid-media-url]', url_hash = ?1, file_hash = NULL,
+                         url_requires_cache = 1, cache_status = 'invalid',
+                         updated_at = CASE WHEN updated_at = 0 THEN ?2 ELSE updated_at END
+                     WHERE id = ?3",
+                    rusqlite::params![legacy_url_hash, created_at, id],
+                )?;
+            }
+        }
+    }
+
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_stickers_url_hash_v14
+            ON stickers(url_hash);
+        CREATE INDEX IF NOT EXISTS idx_stickers_delivery_v14
+            ON stickers(url_requires_cache, cache_status, last_used DESC, id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn sanitize_media_url_column(conn: &Connection, table: &str) -> Result<(), rusqlite::Error> {
+    let rows = {
+        let mut statement = conn.prepare(&format!(
+            "SELECT id, media_url FROM {table} WHERE media_url IS NOT NULL"
+        ))?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let update = format!("UPDATE {table} SET media_url = ?1 WHERE id = ?2");
+    for (id, raw_url) in rows {
+        conn.execute(
+            &update,
+            rusqlite::params![crate::media::redact_url_for_storage(&raw_url), id],
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -1019,7 +1122,15 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         ),
         (
             "stickers",
-            &["media_url", "file_hash", "source_session"][..],
+            &[
+                "media_url",
+                "file_hash",
+                "url_hash",
+                "url_requires_cache",
+                "cache_status",
+                "source_session",
+                "updated_at",
+            ][..],
         ),
         ("sticker_tags", &["sticker_id", "tag", "weight"][..]),
         ("sticker_links", &["sticker_a", "sticker_b", "co_count"][..]),
@@ -1078,6 +1189,8 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_outbound_recovery_route_v12",
         "idx_decision_reflection_v13",
         "idx_reflection_changes_status_time_v13",
+        "idx_stickers_url_hash_v14",
+        "idx_stickers_delivery_v14",
         "ux_knowledge_key_version",
         "idx_persona_subject_protocol",
         "idx_persona_observation_subject",
@@ -1716,6 +1829,93 @@ mod tests {
         assert_eq!(read_schema_version(&backup).unwrap(), 12);
         assert!(!object_exists(&backup, "table", "behavior_calibration").unwrap());
         assert!(!object_exists(&backup, "index", "idx_decision_reflection_v13").unwrap());
+    }
+
+    #[test]
+    fn version_thirteen_database_redacts_media_urls_and_marks_cache_requirements() {
+        let temporary = TempDatabase::new("version-thirteen");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 13).unwrap();
+        let signed_url = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=secret&spec=0#fragment";
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (event_key, protocol, direction, session_type, session_id, sender_id,
+                  content, media_url, created_at, updated_at)
+                 VALUES ('media-event', 'qq-official', 'inbound', 'group', 'group-1',
+                         'user-1', '', ?1, 1, 1)",
+                [signed_url],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO outbound_messages
+                 (action_key, protocol, session_type, session_id, media_url, created_at, updated_at)
+                 VALUES ('media-action', 'qq-official', 'group', 'group-1', ?1, 1, 1)",
+                [signed_url],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO stickers
+                 (protocol, media_url, file_hash, source_session, created_at)
+                 VALUES ('qq-official', ?1, 'legacy-url-hash', 'group-1', 1)",
+                [signed_url],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version thirteen should migrate");
+        let connection = database.conn.lock().unwrap();
+        let sticker: (String, String, Option<String>, i64, String) = connection
+            .query_row(
+                "SELECT media_url, url_hash, file_hash, url_requires_cache, cache_status
+                 FROM stickers LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(!sticker.0.contains("rkey"));
+        assert!(!sticker.0.contains("fragment"));
+        assert!(sticker.0.contains("fileid=abc"));
+        assert_eq!(sticker.1.len(), 64);
+        assert_eq!(sticker.2, None);
+        assert_eq!((sticker.3, sticker.4.as_str()), (1, "required"));
+        for table in ["messages", "outbound_messages"] {
+            let url: String = connection
+                .query_row(
+                    &format!("SELECT media_url FROM {table} LIMIT 1"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!url.contains("rkey"));
+            assert!(!url.contains("secret"));
+        }
+        assert!(object_exists(&connection, "index", "idx_stickers_url_hash_v14").unwrap());
+        assert!(object_exists(&connection, "index", "idx_stickers_delivery_v14").unwrap());
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 13);
+        assert!(!column_exists(&backup, "stickers", "url_hash").unwrap());
+        let raw_url: String = backup
+            .query_row("SELECT media_url FROM stickers LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(raw_url.contains("rkey=secret"));
     }
 
     #[test]

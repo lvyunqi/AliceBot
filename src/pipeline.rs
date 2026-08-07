@@ -526,7 +526,7 @@ fn redact_value(value: &mut Value) {
                     *child = Value::String("[REDACTED]".to_string());
                 } else if (lower == "url" || lower.ends_with("_url")) && child.as_str().is_some() {
                     if let Some(url) = child.as_str() {
-                        *child = Value::String(redact_url_query(url));
+                        *child = Value::String(crate::media::redact_url_for_storage(url));
                     }
                 } else {
                     redact_value(child);
@@ -545,34 +545,6 @@ fn redact_value(value: &mut Value) {
 fn digest_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn redact_url_query(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
-    };
-    let safe_query = query
-        .split('&')
-        .filter(|part| {
-            let key = part
-                .split('=')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            !(key.contains("token")
-                || key.contains("secret")
-                || key.contains("rkey")
-                || key.contains("signature")
-                || key == "sig"
-                || key == "auth"
-                || key.ends_with("_key"))
-        })
-        .collect::<Vec<_>>();
-    if safe_query.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}?{}", safe_query.join("&"))
-    }
 }
 
 /// 组装有总预算的人设、画像、记忆和对话上下文并调用 LLM 生成回复。
@@ -831,7 +803,7 @@ mod tests {
                     "content":"",
                     "timestamp":"2026-08-07T01:02:24+08:00",
                     "author":{"member_openid":"member-1","username":"夜空"},
-                    "attachments":[{"content_type":"image/png","url":"https://example.com/a.png"}],
+                    "attachments":[{"content_type":"image/png","url":"https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=temporary&spec=0"}],
                     "message_scene":{"ext":["auth_token=do-not-persist"],"source":"default"}
                 }
             }"#
@@ -849,8 +821,12 @@ mod tests {
         assert_eq!(message.message_id, "message-1");
         assert!(message.content.is_empty());
         assert_eq!(message.media.len(), 1);
+        assert!(message.media[0].url.contains("rkey=temporary"));
         assert!(!message.safe_raw_json.contains("auth_token"));
         assert!(!message.safe_raw_json.contains("do-not-persist"));
+        assert!(!message.safe_raw_json.contains("rkey"));
+        assert!(!message.safe_raw_json.contains("temporary"));
+        assert!(message.safe_raw_json.contains("fileid=abc"));
     }
 
     #[test]

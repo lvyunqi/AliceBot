@@ -48,6 +48,14 @@ pub fn should_send(event_key: &str, probability: f32) -> bool {
 
 async fn find_best(session_id: &str, keyword: &str) -> Option<(i64, String)> {
     let database = crate::pipeline::try_db()?;
+    find_best_in_database(&database, session_id, keyword)
+}
+
+fn find_best_in_database(
+    database: &crate::db::Database,
+    session_id: &str,
+    keyword: &str,
+) -> Option<(i64, String)> {
     let connection = database.conn.lock().ok()?;
     let keyword = escape_like(keyword.trim());
     let pattern = if keyword.is_empty() {
@@ -60,7 +68,9 @@ async fn find_best(session_id: &str, keyword: &str) -> Option<(i64, String)> {
             "SELECT s.id, s.media_url
              FROM stickers s
              LEFT JOIN sticker_tags t ON t.sticker_id = s.id
-             WHERE s.media_url LIKE ?1 ESCAPE '\\' OR t.tag LIKE ?1 ESCAPE '\\'
+             WHERE s.url_requires_cache = 0
+               AND s.cache_status = 'remote'
+               AND (s.media_url LIKE ?1 ESCAPE '\\' OR t.tag LIKE ?1 ESCAPE '\\')
              GROUP BY s.id
              ORDER BY (s.source_session = ?2) DESC,
                       s.usage_count DESC,
@@ -74,10 +84,15 @@ async fn find_best(session_id: &str, keyword: &str) -> Option<(i64, String)> {
 
 async fn url_for_id(sticker_id: i64) -> Option<String> {
     let database = crate::pipeline::try_db()?;
+    url_for_id_in_database(&database, sticker_id)
+}
+
+fn url_for_id_in_database(database: &crate::db::Database, sticker_id: i64) -> Option<String> {
     let connection = database.conn.lock().ok()?;
     let url = connection
         .query_row(
-            "SELECT media_url FROM stickers WHERE id = ?1",
+            "SELECT media_url FROM stickers
+             WHERE id = ?1 AND url_requires_cache = 0 AND cache_status = 'remote'",
             rusqlite::params![sticker_id],
             |row| row.get::<_, String>(0),
         )
@@ -111,5 +126,30 @@ mod tests {
     #[test]
     fn like_pattern_escapes_wildcards() {
         assert_eq!(escape_like("a_%"), "a\\_\\%");
+    }
+
+    #[test]
+    fn signed_url_reference_is_not_selected_until_cached() {
+        let database = crate::db::Database::open(":memory:").unwrap();
+        let connection = database.conn.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO stickers
+                 (protocol, media_url, url_hash, url_requires_cache, cache_status,
+                  source_session, usage_count, created_at, updated_at)
+                 VALUES ('qq-official', 'https://example.test/signed.png', 'signed', 1,
+                         'required', 'group-1', 100, 1, 1),
+                        ('onebot11', 'https://example.test/public.png', 'public', 0,
+                         'remote', 'group-1', 1, 1, 1)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            find_best_in_database(&database, "group-1", ""),
+            Some((2, "https://example.test/public.png".to_string()))
+        );
+        assert_eq!(url_for_id_in_database(&database, 1), None);
     }
 }

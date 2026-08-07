@@ -111,7 +111,7 @@ impl Database {
         let media_url = msg
             .media
             .first()
-            .map(|media| redact_url_for_storage(&media.url));
+            .map(|media| crate::media::redact_url_for_storage(&media.url));
         let changed = conn.execute(
             "INSERT OR IGNORE INTO messages
              (event_key, protocol, bot_account_id, direction, session_type, session_id, sender_id,
@@ -199,7 +199,10 @@ impl Database {
                     attempt.session_id,
                     truncate_for_storage(&attempt.content),
                     attempt.media_type,
-                    attempt.media_url.as_deref().map(redact_url_for_storage),
+                    attempt
+                        .media_url
+                        .as_deref()
+                        .map(crate::media::redact_url_for_storage),
                     now,
                     id,
                 ],
@@ -222,7 +225,10 @@ impl Database {
                 attempt.session_id,
                 truncate_for_storage(&attempt.content),
                 attempt.media_type,
-                attempt.media_url.as_deref().map(redact_url_for_storage),
+                attempt
+                    .media_url
+                    .as_deref()
+                    .map(crate::media::redact_url_for_storage),
                 now,
             ],
         )?;
@@ -406,35 +412,6 @@ pub async fn init_database(path: &str) -> Result<Database, String> {
 
 fn truncate_for_storage(value: &str) -> String {
     value.chars().take(16_384).collect()
-}
-
-/// 签名 URL 可能携带 rkey/token 等短期凭据，数据库只保存去除敏感查询参数的形式。
-fn redact_url_for_storage(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return truncate_for_storage(url);
-    };
-    let safe_query = query
-        .split('&')
-        .filter(|part| {
-            let key = part
-                .split('=')
-                .next()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            !(key.contains("token")
-                || key.contains("secret")
-                || key.contains("rkey")
-                || key.contains("signature")
-                || key == "sig"
-                || key == "auth"
-                || key.ends_with("_key"))
-        })
-        .collect::<Vec<_>>();
-    if safe_query.is_empty() {
-        truncate_for_storage(base)
-    } else {
-        truncate_for_storage(&format!("{}?{}", base, safe_query.join("&")))
-    }
 }
 
 #[cfg(test)]
