@@ -5,12 +5,16 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use sha2::{Digest, Sha256};
+
 use crate::pipeline::InMessage;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMessage {
+    pub event_key: String,
     pub role: String,
     pub content: String,
+    pub speaker: String,
     pub timestamp: i64,
     pub is_key: bool,
 }
@@ -29,10 +33,12 @@ const MAX_MAX_MESSAGES: usize = 200;
 /// 推入用户消息。
 pub async fn push(msg: &InMessage) {
     push_message(
-        &msg.session_id,
+        &scoped_session_key(&msg.protocol, &msg.session_type, &msg.session_id),
         ContextMessage {
+            event_key: msg.event_key.clone(),
             role: "user".to_string(),
             content: context_content(&msg.content, &msg.media, msg.has_media),
+            speaker: speaker_label(msg),
             timestamp: msg.timestamp,
             is_key: false,
         },
@@ -40,15 +46,23 @@ pub async fn push(msg: &InMessage) {
 }
 
 /// 推入已经成功发送的机器人消息。
-pub async fn push_assistant(session_id: &str, content: &str, timestamp: i64) {
+pub async fn push_assistant(
+    protocol: &str,
+    session_type: &str,
+    session_id: &str,
+    content: &str,
+    timestamp: i64,
+) {
     if content.trim().is_empty() {
         return;
     }
     push_message(
-        session_id,
+        &scoped_session_key(protocol, session_type, session_id),
         ContextMessage {
+            event_key: String::new(),
             role: "assistant".to_string(),
             content: content.trim().to_string(),
+            speaker: String::new(),
             timestamp,
             is_key: false,
         },
@@ -94,7 +108,12 @@ fn push_message(session_id: &str, message: ContextMessage) {
 /// 近似算法按 Unicode 字符计数，ASCII 文本每 4 个字符约 1 token，中文等
 /// 非 ASCII 字符按 1 个字符约 1 token 估算。它不依赖具体模型 tokenizer，
 /// 但能稳定地防止上下文无限增长。
-pub fn get_context(session_id: &str, max_tokens: u32) -> Vec<ContextMessage> {
+pub fn get_context(
+    protocol: &str,
+    session_type: &str,
+    session_id: &str,
+    max_tokens: u32,
+) -> Vec<ContextMessage> {
     let configured_limit = crate::pipeline::current_config()
         .memories
         .short_size
@@ -104,7 +123,8 @@ pub fn get_context(session_id: &str, max_tokens: u32) -> Vec<ContextMessage> {
     let Ok(contexts) = SHORT_CONTEXTS.lock() else {
         return Vec::new();
     };
-    let Some(session) = contexts.iter().find(|item| item.session_id == session_id) else {
+    let key = scoped_session_key(protocol, session_type, session_id);
+    let Some(session) = contexts.iter().find(|item| item.session_id == key) else {
         return Vec::new();
     };
 
@@ -124,13 +144,62 @@ pub fn get_context(session_id: &str, max_tokens: u32) -> Vec<ContextMessage> {
     selected.into_iter().collect()
 }
 
+/// Drop process-local context during plugin shutdown/reload.
+pub fn clear() {
+    if let Ok(mut contexts) = SHORT_CONTEXTS.lock() {
+        contexts.clear();
+    }
+}
+
 pub fn estimate_tokens(text: &str) -> usize {
     let ascii = text
         .chars()
         .filter(|character| character.is_ascii())
         .count();
     let non_ascii = text.chars().count().saturating_sub(ascii);
-    ((ascii + 3) / 4) + non_ascii
+    ascii.div_ceil(4) + non_ascii
+}
+
+/// Build a collision-resistant in-process key for one protocol/session route.
+///
+/// The raw IDs are never sent to the model; the length prefixes only make the
+/// internal key unambiguous even when an ID contains the separator character.
+pub fn scoped_session_key(protocol: &str, session_type: &str, session_id: &str) -> String {
+    format!(
+        "{}:{}|{}:{}|{}:{}",
+        protocol.len(),
+        protocol,
+        session_type.len(),
+        session_type,
+        session_id.len(),
+        session_id
+    )
+}
+
+/// Return a stable, privacy-preserving speaker label for prompt attribution.
+/// A short digest keeps two users with the same nickname distinguishable
+/// without exposing platform-specific IDs to the LLM.
+pub fn speaker_label(msg: &InMessage) -> String {
+    let nickname = msg
+        .sender_name
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(24)
+        .collect::<String>();
+    let mut digest = Sha256::new();
+    digest.update(msg.protocol.as_bytes());
+    digest.update([0]);
+    digest.update(msg.sender_id.as_bytes());
+    let digest = digest.finalize();
+    let suffix = digest[..3]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    if nickname.trim().is_empty() {
+        format!("成员#{suffix}")
+    } else {
+        format!("{}#{suffix}", nickname.trim())
+    }
 }
 
 fn context_content(content: &str, media: &[crate::pipeline::MediaRef], has_media: bool) -> String {
@@ -174,10 +243,10 @@ mod tests {
     async fn context_is_chronological_and_contains_assistant_messages() {
         let session = format!("short-test-{}", std::process::id());
         push(&message(&session, "first", 1)).await;
-        push_assistant(&session, "reply", 2).await;
+        push_assistant("onebot11", "group", &session, "reply", 2).await;
         push(&message(&session, "second", 3)).await;
 
-        let context = get_context(&session, 100);
+        let context = get_context("onebot11", "group", &session, 100);
         assert_eq!(
             context
                 .iter()
@@ -196,11 +265,43 @@ mod tests {
         push(&message(&session, "old message", 1)).await;
         push(&message(&session, "latest", 2)).await;
 
-        let context = get_context(&session, 2);
+        let context = get_context("onebot11", "group", &session, 2);
         assert_eq!(
             context.last().map(|item| item.content.as_str()),
             Some("latest")
         );
         assert!(context.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn context_is_isolated_by_protocol_and_session_type() {
+        let session = format!("route-test-{}", std::process::id());
+        let mut onebot = message(&session, "onebot", 1);
+        let mut official = message(&session, "official", 2);
+        official.protocol = "qq-official".to_string();
+        let mut private = message(&session, "private", 3);
+        private.session_type = "private".to_string();
+
+        push(&onebot).await;
+        push(&official).await;
+        push(&private).await;
+
+        assert_eq!(
+            get_context("onebot11", "group", &session, 100)[0].content,
+            "onebot"
+        );
+        assert_eq!(
+            get_context("qq-official", "group", &session, 100)[0].content,
+            "official"
+        );
+        assert_eq!(
+            get_context("onebot11", "private", &session, 100)[0].content,
+            "private"
+        );
+
+        onebot.sender_name = "same name".to_string();
+        official.sender_name = "same name".to_string();
+        assert_ne!(speaker_label(&onebot), speaker_label(&official));
+        assert!(!speaker_label(&onebot).contains(&onebot.sender_id));
     }
 }

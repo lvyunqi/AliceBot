@@ -102,6 +102,7 @@ mod plugin {
         let rt = &*RUNTIME;
         rt.shutdown();
         decision::clear_runtime_state();
+        memory::clear_runtime_state();
         pipeline::clear_db();
         pipeline::clear_config();
         log::info!("[AliceBot] 已关闭");

@@ -5,12 +5,14 @@
 
 mod candidates;
 pub mod compact;
+mod context;
 mod knowledge;
 pub mod long;
 pub mod persona;
 pub(crate) mod search;
 pub mod short;
 
+pub(crate) use context::{ContextInput, assemble as assemble_prompt_context};
 pub use persona::*;
 
 use crate::pipeline::InMessage;
@@ -28,13 +30,29 @@ pub async fn push_short_context(msg: &InMessage) {
 }
 
 /// 获取用于 LLM 的短期上下文。
-pub fn short_context(session_id: &str, max_tokens: u32) -> Vec<short::ContextMessage> {
-    short::get_context(session_id, max_tokens)
+pub fn short_context(
+    protocol: &str,
+    session_type: &str,
+    session_id: &str,
+    max_tokens: u32,
+) -> Vec<short::ContextMessage> {
+    short::get_context(protocol, session_type, session_id, max_tokens)
 }
 
 /// 推入已经成功发送的机器人回复。
-pub async fn push_assistant_context(session_id: &str, content: &str, timestamp: i64) {
-    short::push_assistant(session_id, content, timestamp).await;
+pub async fn push_assistant_context(
+    protocol: &str,
+    session_type: &str,
+    session_id: &str,
+    content: &str,
+    timestamp: i64,
+) {
+    short::push_assistant(protocol, session_type, session_id, content, timestamp).await;
+}
+
+/// Clear volatile memory when the dynamic plugin instance is stopped.
+pub fn clear_runtime_state() {
+    short::clear();
 }
 
 /// 按关键词遗忘
