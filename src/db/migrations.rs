@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 8;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 9;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +124,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         6 => migration_6_session_state(transaction)?,
         7 => migration_7_structured_memory(transaction)?,
         8 => migration_8_memory_retrieval(transaction)?,
+        9 => migration_9_persona_and_knowledge_evidence(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -525,6 +526,139 @@ fn migration_8_memory_retrieval(conn: &Connection) -> Result<(), rusqlite::Error
     Ok(())
 }
 
+fn migration_9_persona_and_knowledge_evidence(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(conn, "knowledge", "protocol", "TEXT")?;
+    ensure_column(conn, "knowledge", "session_type", "TEXT")?;
+    ensure_column(conn, "knowledge", "session_id", "TEXT")?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE personas_v9 (
+            protocol             TEXT NOT NULL,
+            subject_id           TEXT NOT NULL,
+            nickname             TEXT NOT NULL DEFAULT '',
+            first_seen           INTEGER NOT NULL DEFAULT 0,
+            last_seen            INTEGER NOT NULL DEFAULT 0,
+            interaction_count    INTEGER NOT NULL DEFAULT 0,
+            intimacy             INTEGER NOT NULL DEFAULT 0,
+            intimacy_ewma        REAL NOT NULL DEFAULT 0,
+            intimacy_updated_at  INTEGER NOT NULL DEFAULT 0,
+            relation             TEXT NOT NULL DEFAULT 'stranger',
+            traits               TEXT NOT NULL DEFAULT '{}',
+            preferences          TEXT NOT NULL DEFAULT '{}',
+            topics               TEXT NOT NULL DEFAULT '{}',
+            notes                TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (protocol, subject_id)
+        );
+
+        INSERT INTO personas_v9
+            (protocol, subject_id, nickname, first_seen, last_seen,
+             interaction_count, intimacy, intimacy_ewma, intimacy_updated_at,
+             relation, traits, preferences, topics, notes)
+        SELECT COALESCE(NULLIF(protocol, ''), 'unknown'),
+               subject_id,
+               COALESCE(nickname, ''),
+               COALESCE(first_seen, 0),
+               COALESCE(last_seen, 0),
+               COALESCE(interaction_count, 0),
+               COALESCE(intimacy, 0),
+               COALESCE(intimacy, 0),
+               COALESCE(last_seen, 0),
+               COALESCE(NULLIF(relation, ''), 'stranger'),
+               COALESCE(NULLIF(traits, ''), '{}'),
+               COALESCE(NULLIF(preferences, ''), '{}'),
+               COALESCE(NULLIF(topics, ''), '{}'),
+               COALESCE(notes, '')
+        FROM personas
+        WHERE subject_id IS NOT NULL AND TRIM(subject_id) <> '';
+
+        DROP TABLE personas;
+        ALTER TABLE personas_v9 RENAME TO personas;
+
+        CREATE INDEX idx_persona_subject_protocol
+            ON personas(subject_id, protocol);
+
+        CREATE TABLE persona_observations (
+            protocol     TEXT NOT NULL,
+            event_key    TEXT NOT NULL,
+            subject_id   TEXT NOT NULL,
+            session_id   TEXT NOT NULL,
+            observed_at  INTEGER NOT NULL,
+            PRIMARY KEY (protocol, event_key),
+            FOREIGN KEY (protocol, subject_id)
+                REFERENCES personas(protocol, subject_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_persona_observation_subject
+            ON persona_observations(protocol, subject_id, observed_at);
+
+        CREATE TABLE persona_nicknames (
+            protocol        TEXT NOT NULL,
+            subject_id      TEXT NOT NULL,
+            nickname        TEXT NOT NULL,
+            first_seen      INTEGER NOT NULL,
+            last_seen       INTEGER NOT NULL,
+            seen_count      INTEGER NOT NULL DEFAULT 1,
+            is_current      INTEGER NOT NULL DEFAULT 0,
+            last_event_key  TEXT NOT NULL,
+            PRIMARY KEY (protocol, subject_id, nickname),
+            FOREIGN KEY (protocol, subject_id)
+                REFERENCES personas(protocol, subject_id) ON DELETE CASCADE
+        );
+        INSERT INTO persona_nicknames
+            (protocol, subject_id, nickname, first_seen, last_seen,
+             seen_count, is_current, last_event_key)
+        SELECT protocol, subject_id, nickname, first_seen, last_seen,
+               MAX(interaction_count, 1), 1, 'migration:v9'
+        FROM personas
+        WHERE nickname <> '';
+        CREATE INDEX idx_persona_nickname_current
+            ON persona_nicknames(protocol, subject_id, is_current, last_seen);
+
+        CREATE TABLE persona_topics (
+            protocol    TEXT NOT NULL,
+            subject_id  TEXT NOT NULL,
+            topic       TEXT NOT NULL,
+            count       INTEGER NOT NULL DEFAULT 1,
+            score       REAL NOT NULL DEFAULT 1,
+            first_seen  INTEGER NOT NULL,
+            last_seen   INTEGER NOT NULL,
+            PRIMARY KEY (protocol, subject_id, topic),
+            FOREIGN KEY (protocol, subject_id)
+                REFERENCES personas(protocol, subject_id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_persona_topics_rank
+            ON persona_topics(protocol, subject_id, score DESC, count DESC, last_seen DESC);
+
+        CREATE TABLE knowledge_sources (
+            knowledge_id       INTEGER NOT NULL,
+            source_type        TEXT NOT NULL,
+            source_id          TEXT NOT NULL,
+            source_subject_id  TEXT NOT NULL,
+            evidence_weight    INTEGER NOT NULL DEFAULT 1,
+            created_at         INTEGER NOT NULL,
+            PRIMARY KEY (knowledge_id, source_type, source_id),
+            FOREIGN KEY (knowledge_id) REFERENCES knowledge(id) ON DELETE CASCADE
+        );
+        CREATE INDEX idx_knowledge_sources_source
+            ON knowledge_sources(source_type, source_id);
+        CREATE INDEX idx_knowledge_sources_subject
+            ON knowledge_sources(knowledge_id, source_subject_id);
+        CREATE INDEX idx_knowledge_scope_v9
+            ON knowledge(
+                status, is_active, scope, protocol,
+                session_type, session_id, category, confidence
+            );
+
+        INSERT OR IGNORE INTO knowledge_sources
+            (knowledge_id, source_type, source_id, source_subject_id,
+             evidence_weight, created_at)
+        SELECT id, 'legacy', source, 'legacy', 1, COALESCE(created_at, 0)
+        FROM knowledge
+        WHERE source IS NOT NULL AND TRIM(source) <> '';
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -614,7 +748,36 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
             "memory_sources",
             &["memory_id", "source_type", "source_id", "evidence_weight"][..],
         ),
-        ("personas", &["subject_id", "nickname", "intimacy"][..]),
+        (
+            "personas",
+            &[
+                "protocol",
+                "subject_id",
+                "nickname",
+                "intimacy",
+                "intimacy_ewma",
+                "intimacy_updated_at",
+            ][..],
+        ),
+        (
+            "persona_observations",
+            &["event_key", "protocol", "subject_id", "observed_at"][..],
+        ),
+        (
+            "persona_nicknames",
+            &[
+                "protocol",
+                "subject_id",
+                "nickname",
+                "seen_count",
+                "is_current",
+                "last_event_key",
+            ][..],
+        ),
+        (
+            "persona_topics",
+            &["protocol", "subject_id", "topic", "count", "score"][..],
+        ),
         (
             "knowledge",
             &[
@@ -622,10 +785,23 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "confidence",
                 "normalized_key",
                 "scope",
+                "protocol",
+                "session_type",
+                "session_id",
                 "status",
                 "version",
                 "superseded_by",
                 "is_active",
+            ][..],
+        ),
+        (
+            "knowledge_sources",
+            &[
+                "knowledge_id",
+                "source_type",
+                "source_id",
+                "source_subject_id",
+                "evidence_weight",
             ][..],
         ),
         (
@@ -667,6 +843,13 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_memory_sources_source",
         "idx_memory_retrieve_v8",
         "ux_knowledge_key_version",
+        "idx_persona_subject_protocol",
+        "idx_persona_observation_subject",
+        "idx_persona_nickname_current",
+        "idx_persona_topics_rank",
+        "idx_knowledge_sources_source",
+        "idx_knowledge_sources_subject",
+        "idx_knowledge_scope_v9",
     ];
     for index in required_indexes {
         if !object_exists(conn, "index", index)? {
@@ -1014,6 +1197,78 @@ mod tests {
         assert_eq!(read_schema_version(&backup).unwrap(), 7);
         assert!(!object_exists(&backup, "index", "idx_memory_retrieve_v8").unwrap());
         assert!(!object_exists(&backup, "table", "memory_fts").unwrap());
+    }
+
+    #[test]
+    fn version_eight_database_gains_protocol_scoped_personas_and_knowledge_sources() {
+        let temporary = TempDatabase::new("version-eight");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 8).unwrap();
+        connection
+            .execute(
+                "INSERT INTO personas
+                 (subject_id, protocol, nickname, first_seen, last_seen,
+                  interaction_count, intimacy, relation, traits, preferences, topics, notes)
+                 VALUES ('user-1', 'onebot11', 'before-upgrade', 10, 20,
+                         7, 35, 'familiar', '{}', '{}', '{}', '')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO knowledge
+                 (normalized_key, subject, content, category, scope, source,
+                  confidence, status, version, is_active, created_at, updated_at)
+                 VALUES ('legacy:knowledge:test', 'schedule', 'Friday meeting',
+                         'group_fact', 'session', 'legacy-message', 70,
+                         'candidate', 1, 0, 10, 10)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version eight should migrate");
+        let connection = database.conn.lock().unwrap();
+        let persona: (String, String, f64) = connection
+            .query_row(
+                "SELECT protocol, nickname, intimacy_ewma
+                 FROM personas WHERE protocol = 'onebot11' AND subject_id = 'user-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            persona,
+            ("onebot11".to_string(), "before-upgrade".to_string(), 35.0)
+        );
+        assert!(object_exists(&connection, "table", "persona_nicknames").unwrap());
+        assert!(object_exists(&connection, "table", "persona_topics").unwrap());
+        assert!(object_exists(&connection, "table", "knowledge_sources").unwrap());
+        let nickname_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM persona_nicknames WHERE is_current = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(nickname_count, 1);
+        assert!(column_exists(&connection, "knowledge", "protocol").unwrap());
+        assert!(column_exists(&connection, "knowledge", "session_id").unwrap());
+        let source_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM knowledge_sources", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(source_count, 1);
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 8);
+        assert!(!object_exists(&backup, "table", "persona_nicknames").unwrap());
+        assert!(!object_exists(&backup, "table", "knowledge_sources").unwrap());
     }
 
     #[test]

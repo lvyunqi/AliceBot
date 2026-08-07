@@ -303,39 +303,6 @@ impl Database {
         Ok(())
     }
 
-    /// 更新或插入用户画像
-    pub fn upsert_persona(&self, persona: &crate::memory::Persona) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO personas (subject_id, protocol, nickname, first_seen, last_seen, interaction_count, intimacy, relation, traits, preferences, topics, notes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-             ON CONFLICT(subject_id) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                interaction_count = excluded.interaction_count,
-                intimacy = excluded.intimacy,
-                nickname = excluded.nickname,
-                traits = excluded.traits,
-                preferences = excluded.preferences,
-                topics = excluded.topics,
-                notes = excluded.notes",
-            params![
-                persona.subject_id,
-                persona.protocol,
-                persona.nickname,
-                persona.first_seen,
-                persona.last_seen,
-                persona.interaction_count,
-                persona.intimacy,
-                persona.relation,
-                persona.traits,
-                persona.preferences,
-                persona.topics,
-                persona.notes,
-            ],
-        )?;
-        Ok(())
-    }
-
     /// 获取元数据
     pub fn get_meta(&self, key: &str) -> Result<Option<String>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();

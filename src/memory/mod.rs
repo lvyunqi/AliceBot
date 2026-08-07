@@ -5,6 +5,7 @@
 
 mod candidates;
 pub mod compact;
+mod knowledge;
 pub mod long;
 pub mod persona;
 pub(crate) mod search;
@@ -18,6 +19,7 @@ use crate::pipeline::InMessage;
 pub async fn observe_user(msg: &InMessage) {
     persona::observe(msg).await;
     candidates::observe(msg).await;
+    knowledge::observe(msg).await;
 }
 
 /// 推入短期上下文

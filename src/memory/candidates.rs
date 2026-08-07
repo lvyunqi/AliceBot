@@ -374,7 +374,7 @@ fn hex_prefix(bytes: &[u8]) -> String {
         .collect()
 }
 
-fn contains_sensitive_content(text: &str) -> bool {
+pub(super) fn contains_sensitive_content(text: &str) -> bool {
     [
         "密码",
         "验证码",
