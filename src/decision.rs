@@ -1,5 +1,6 @@
-//! Deterministic reply decision engine with persisted traces.
+//! 带持久化决策 trace 的确定性回复决策引擎。
 mod coalesce;
+mod judge;
 #[cfg(test)]
 mod replay;
 mod session;
@@ -10,6 +11,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 pub(crate) use coalesce::CoalescedMessage;
+pub(crate) use judge::ReplyStyleHint;
+use judge::{ReplyJudgeStatus, ReplyJudgeTrace, apply_optional_reply_judge};
 
 const POLICY_VERSION: &str = "reply-v3-gated";
 const MIN_AUTONOMOUS_SCORE: f32 = 32.0;
@@ -49,6 +52,8 @@ pub struct ReplyDecision {
     pub p_final: f32,
     pub random_value: f32,
     pub learned_reply_bias_offset: f32,
+    /// 只保存分类状态与受限字段，不保存模型原始输出。
+    llm_judge: Option<ReplyJudgeTrace>,
 }
 
 pub fn observe_message(msg: &InMessage) {
@@ -67,21 +72,37 @@ pub fn clear_runtime_state() {
     coalesce::clear();
 }
 
-/// 判断是否回复，并将结果写入 decision_traces。
-pub async fn should_reply(msg: &InMessage, coalesced_count: usize) -> bool {
-    let decision = evaluate(msg);
+/// 判断是否回复并返回分类器认可的有限风格提示，供同一轮生成消费。
+pub async fn should_reply_with_style(
+    msg: &InMessage,
+    coalesced_count: usize,
+) -> (bool, Option<ReplyStyleHint>) {
+    let mut decision = evaluate(msg);
+    apply_optional_reply_judge(msg, &mut decision).await;
     persist_trace(msg, &decision, coalesced_count);
+    let style_hint = decision
+        .llm_judge
+        .as_ref()
+        .filter(|judge| judge.status == ReplyJudgeStatus::Applied && decision.should_reply)
+        .and_then(|judge| judge.style_hint.as_ref())
+        .cloned();
+    let judge_status = decision
+        .llm_judge
+        .as_ref()
+        .map(|judge| judge.status.as_str())
+        .unwrap_or("not_called");
     log::trace!(
-        "[AliceBot] decision: event_key={}, score={:.1}, p_final={:.3}, random={:.3}, direct={}, reply={}, reason={}",
+        "[AliceBot] decision: event_key={}, score={:.1}, p_final={:.3}, random={:.3}, direct={}, judge={}, reply={}, reason={}",
         msg.event_key,
         decision.score,
         decision.p_final,
         decision.random_value,
         decision.direct,
+        judge_status,
         decision.should_reply,
         decision.reason
     );
-    decision.should_reply
+    (decision.should_reply, style_hint)
 }
 
 /// 纯函数式决策入口（数据库信号只读），适合离线回放和单元测试。
@@ -100,6 +121,7 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
             p_final: 0.0,
             random_value: deterministic_random(&msg.event_key, POLICY_VERSION),
             learned_reply_bias_offset: 0.0,
+            llm_judge: None,
         };
     }
 
@@ -189,6 +211,7 @@ fn evaluate_with_signals_and_offset(
         p_final,
         random_value,
         learned_reply_bias_offset: applied_offset,
+        llm_judge: None,
     }
 }
 
@@ -237,6 +260,15 @@ fn persist_trace(msg: &InMessage, decision: &ReplyDecision, coalesced_count: usi
     let Some(database) = crate::pipeline::try_db() else {
         return;
     };
+    let llm_judge = decision.llm_judge.as_ref().map(|judge| {
+        json!({
+            "status": judge.status.as_str(),
+            "reply": judge.reply,
+            "confidence": judge.confidence,
+            "style_hint": judge.style_hint.as_ref().map(ReplyStyleHint::as_str),
+            "error_kind": judge.error_kind,
+        })
+    });
     let signals_json = json!({
         "mentioned": decision.signals.mentioned,
         "is_question": decision.signals.is_question,
@@ -256,6 +288,7 @@ fn persist_trace(msg: &InMessage, decision: &ReplyDecision, coalesced_count: usi
         "out_of_topic": decision.signals.out_of_topic,
         "has_media": decision.signals.has_media,
         "learned_reply_bias_offset": decision.learned_reply_bias_offset,
+        "llm_judge": llm_judge,
     })
     .to_string();
     let trace = crate::db::DecisionTrace {

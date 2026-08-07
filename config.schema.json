@@ -192,6 +192,12 @@
           "description": "关闭后仅处理明确 @、平台回复、明确问题或紧急消息",
           "default": true
         },
+        "reply_judge_enabled": {
+          "type": "boolean",
+          "title": "启用模糊区判断",
+          "description": "仅在规则评分模糊区调用 LLM 分类；超时、错误或低置信度时保持规则结果",
+          "default": false
+        },
         "reply_bias": {
           "type": "number",
           "title": "回复倾向",

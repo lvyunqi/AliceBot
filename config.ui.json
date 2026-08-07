@@ -61,7 +61,7 @@
       }
     },
     "decision": {
-      "ui:order": ["enabled", "reply_bias", "min_interval_sec", "coalesce_window_ms", "activity_alpha", "quiet_threshold", "burst_threshold"],
+      "ui:order": ["enabled", "reply_judge_enabled", "reply_bias", "min_interval_sec", "coalesce_window_ms", "activity_alpha", "quiet_threshold", "burst_threshold"],
       "reply_bias": {
         "ui:widget": "slider"
       },

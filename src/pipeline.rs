@@ -1,7 +1,7 @@
 //! 消息异步流水线。
 //!
-//! FFI 回调只把 `InterceptorRequest` 中的 ABI 字段复制到 `InboundEvent`，之后所有
-//! 处理都使用插件自己拥有的数据，避免宿主请求引用逃逸到异步 runtime。
+//! FFI 回调只在宿主完成分发后把 `InterceptorRequest` 中的 ABI 字段复制到
+//! `InboundEvent`，之后所有处理都使用插件自己拥有的数据，避免宿主请求引用逃逸到异步 runtime。
 
 use abi_stable_host_api::{CommandRequest, InterceptorRequest};
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::config::AppConfig;
 use crate::db::Database;
 use crate::decision;
-use crate::llm::{ChatMessage, ChatRequest, LlmClient};
+use crate::llm::{ChatMessage, ChatRequest, ChatResponse, ErrorKind, LlmClient, LlmError};
 use crate::memory;
 use crate::send;
 use crate::stickers;
@@ -286,12 +286,13 @@ async fn process_recorded_message_inner(msg: InMessage) {
     let coalesced_count = batch.source_event_keys.len();
     let msg = batch.message;
 
-    if !decision::should_reply(&msg, coalesced_count).await {
+    let (should_reply, style_hint) = decision::should_reply_with_style(&msg, coalesced_count).await;
+    if !should_reply {
         log::trace!("[AliceBot] 决定不回复，event_key={}", msg.event_key);
         return;
     }
 
-    let reply = match generate_reply(&msg, &batch.source_event_keys).await {
+    let reply = match generate_reply(&msg, &batch.source_event_keys, style_hint.as_ref()).await {
         Ok(reply) => reply,
         Err(e) => {
             log::warn!("[AliceBot] 回复生成失败，保持安静: {e}");
@@ -705,7 +706,11 @@ fn digest_hex(bytes: &[u8]) -> String {
 }
 
 /// 组装有总预算的人设、画像、记忆和对话上下文并调用 LLM 生成回复。
-async fn generate_reply(msg: &InMessage, source_event_keys: &[String]) -> Result<String, String> {
+async fn generate_reply(
+    msg: &InMessage,
+    source_event_keys: &[String],
+    style_hint: Option<&decision::ReplyStyleHint>,
+) -> Result<String, String> {
     let state = state().ok_or_else(|| "插件状态尚未初始化".to_string())?;
     if state.llm.provider_count() == 0 {
         return Err("没有配置可用的 LLM provider".to_string());
@@ -736,8 +741,15 @@ async fn generate_reply(msg: &InMessage, source_event_keys: &[String]) -> Result
         &msg.session_id,
         state.config.behavior.max_context_tokens,
     );
+    let mut base_system = persona_prompt(&state.config);
+    if let Some(style_hint) = style_hint {
+        // 风格提示来自固定白名单，仍在上下文组装前纳入总 token 预算。
+        base_system.push_str("\n本轮表达风格提示：");
+        base_system.push_str(style_hint.as_str());
+        base_system.push_str("。这只是语气建议；安全规则、事实准确性和用户请求优先。");
+    }
     let assembled = memory::assemble_prompt_context(memory::ContextInput {
-        base_system: &persona_prompt(&state.config),
+        base_system: &base_system,
         profile: profile.as_deref(),
         long_memories: &long_memories,
         history: &history,
@@ -765,6 +777,23 @@ async fn generate_reply(msg: &InMessage, source_event_keys: &[String]) -> Result
         .await
         .map(|response| response.text.trim().to_string())
         .map_err(|error| format!("{:?}", error.kind))
+}
+
+/// 执行 ReplyJudge 的最小分类请求；状态缺失或无可用 provider 时由调用方回退规则评分。
+pub(crate) async fn run_reply_judge(request: &ChatRequest) -> Result<ChatResponse, LlmError> {
+    let Some(state) = state() else {
+        return Err(LlmError {
+            kind: ErrorKind::NoProvider,
+            message: "reply judge runtime is unavailable".to_string(),
+        });
+    };
+    if state.llm.provider_count() == 0 {
+        return Err(LlmError {
+            kind: ErrorKind::NoProvider,
+            message: "reply judge has no usable provider".to_string(),
+        });
+    }
+    state.llm.chat_with_task("reply_judge", request).await
 }
 
 /// 在后台执行 `/ask`，并通过稳定账号把最终文本发送回原会话。

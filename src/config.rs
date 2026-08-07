@@ -260,12 +260,15 @@ impl Default for BehaviorConfig {
     }
 }
 
-/// Autonomous reply policy. Optional probability/cooldown fields fall back to
-/// their legacy `behavior` locations for one configuration version.
+/// 自主回复策略。概率和冷却字段可在一个配置版本内回退到旧的 `behavior` 位置。
 #[derive(Debug, Clone, Deserialize)]
 pub struct DecisionConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+
+    /// 仅在规则评分模糊区调用可选 LLM 分类器，默认关闭以避免额外模型成本。
+    #[serde(default)]
+    pub reply_judge_enabled: bool,
 
     #[serde(default)]
     pub reply_bias: Option<f32>,
@@ -306,6 +309,7 @@ impl Default for DecisionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            reply_judge_enabled: false,
             reply_bias: None,
             min_interval_sec: None,
             coalesce_window_ms: default_coalesce_window_ms(),
@@ -633,8 +637,18 @@ mod tests {
         let schema: serde_json::Value = serde_json::from_str(include_str!("../config.schema.json"))
             .expect("configuration schema should be valid JSON");
         assert!(schema["properties"]["decision"].is_object());
+        assert!(schema["properties"]["decision"]["properties"]["reply_judge_enabled"].is_object());
         assert!(schema["properties"]["memories"]["properties"]["reflection_enabled"].is_object());
         assert!(schema["properties"]["behavior"]["properties"]["reply_bias"].is_null());
         assert!(schema["properties"]["behavior"]["properties"]["min_interval_sec"].is_null());
+    }
+
+    #[test]
+    fn reply_judge_is_explicitly_opt_in() {
+        assert!(!AppConfig::default().decision.reply_judge_enabled);
+
+        let config = parse_and_validate_config(r#"{"decision":{"reply_judge_enabled":true}}"#)
+            .expect("reply judge configuration should be valid");
+        assert!(config.decision.reply_judge_enabled);
     }
 }
