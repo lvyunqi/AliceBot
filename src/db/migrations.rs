@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 10;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 11;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +126,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         8 => migration_8_memory_retrieval(transaction)?,
         9 => migration_9_persona_and_knowledge_evidence(transaction)?,
         10 => migration_10_delivery_idempotency(transaction)?,
+        11 => migration_11_memory_route_isolation(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -690,6 +691,111 @@ fn migration_10_delivery_idempotency(conn: &Connection) -> Result<(), rusqlite::
     Ok(())
 }
 
+fn migration_11_memory_route_isolation(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(conn, "long_memory", "protocol", "TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(
+        conn,
+        "long_memory",
+        "session_type",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute_batch(
+        r#"
+        UPDATE long_memory
+        SET protocol = CASE
+            WHEN scope = 'global' THEN '*'
+            ELSE COALESCE(
+                (
+                    SELECT CASE
+                        WHEN COUNT(DISTINCT m.protocol) = 1 THEN MAX(m.protocol)
+                    END
+                    FROM memory_sources AS ms
+                    JOIN messages AS m ON m.event_key = ms.source_id
+                    WHERE ms.memory_id = long_memory.id
+                      AND ms.source_type = 'message'
+                      AND m.direction = 'inbound'
+                ),
+                (
+                    SELECT CASE
+                        WHEN COUNT(DISTINCT m.protocol) = 1 THEN MAX(m.protocol)
+                    END
+                    FROM messages AS m
+                    WHERE (long_memory.session_id IS NULL
+                           OR m.session_id = long_memory.session_id)
+                      AND (long_memory.subject_id IS NULL
+                           OR m.sender_id = long_memory.subject_id)
+                      AND m.direction = 'inbound'
+                ),
+                'legacy'
+            )
+        END
+        WHERE TRIM(COALESCE(protocol, '')) = '';
+
+        UPDATE long_memory
+        SET session_type = CASE
+            WHEN scope IN ('global', 'user') THEN '*'
+            ELSE COALESCE(
+                (
+                    SELECT CASE
+                        WHEN COUNT(DISTINCT m.session_type) = 1
+                        THEN MAX(m.session_type)
+                    END
+                    FROM memory_sources AS ms
+                    JOIN messages AS m ON m.event_key = ms.source_id
+                    WHERE ms.memory_id = long_memory.id
+                      AND ms.source_type = 'message'
+                      AND m.direction = 'inbound'
+                ),
+                (
+                    SELECT CASE
+                        WHEN COUNT(DISTINCT m.session_type) = 1
+                        THEN MAX(m.session_type)
+                    END
+                    FROM messages AS m
+                    WHERE (long_memory.session_id IS NULL
+                           OR m.session_id = long_memory.session_id)
+                      AND (long_memory.subject_id IS NULL
+                           OR m.sender_id = long_memory.subject_id)
+                      AND m.direction = 'inbound'
+                ),
+                'legacy'
+            )
+        END
+        WHERE TRIM(COALESCE(session_type, '')) = '';
+
+        UPDATE long_memory
+        SET session_type = 'legacy'
+        WHERE protocol = 'legacy'
+          AND scope IN ('session', 'user_session');
+
+        DROP INDEX IF EXISTS ux_memory_key_version;
+        CREATE UNIQUE INDEX ux_memory_route_key_version
+            ON long_memory(
+                normalized_key,
+                protocol,
+                session_type,
+                COALESCE(session_id, ''),
+                version
+            );
+
+        CREATE INDEX IF NOT EXISTS idx_memory_retrieve_v11
+            ON long_memory(
+                status,
+                is_active,
+                privacy,
+                protocol,
+                session_type,
+                scope,
+                session_id,
+                subject_id,
+                importance DESC,
+                updated_at DESC
+            );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -767,6 +873,8 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
             "long_memory",
             &[
                 "content",
+                "protocol",
+                "session_type",
                 "importance",
                 "confidence",
                 "normalized_key",
@@ -875,9 +983,10 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_llm_calls_status_time",
         "idx_compaction_status_time",
         "ux_session_state_route",
-        "ux_memory_key_version",
+        "ux_memory_route_key_version",
         "idx_memory_sources_source",
         "idx_memory_retrieve_v8",
+        "idx_memory_retrieve_v11",
         "ux_knowledge_key_version",
         "idx_persona_subject_protocol",
         "idx_persona_observation_subject",
@@ -1364,6 +1473,91 @@ mod tests {
         assert_eq!(read_schema_version(&backup).unwrap(), 9);
         assert!(!column_exists(&backup, "messages", "processing_status").unwrap());
         assert!(!object_exists(&backup, "index", "ux_outbound_action_key").unwrap());
+    }
+
+    #[test]
+    fn version_ten_database_gains_protocol_scoped_long_memory() {
+        let temporary = TempDatabase::new("version-ten");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 10).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO messages
+                 (event_key, protocol, direction, session_type, session_id,
+                  sender_id, content, created_at, updated_at)
+                 VALUES ('unique-onebot', 'onebot11', 'inbound', 'group',
+                         'unique-session', 'user-1', 'unique route', 10, 10),
+                        ('shared-onebot', 'onebot11', 'inbound', 'group',
+                         'shared-session', 'user-1', 'onebot route', 11, 11),
+                        ('shared-official', 'qq-official', 'inbound', 'group',
+                         'shared-session', 'user-2', 'official route', 12, 12);
+
+                 INSERT INTO long_memory
+                 (normalized_key, scope, session_id, content, kind, importance,
+                  confidence, privacy, status, version, is_active, created_at, updated_at)
+                 VALUES ('legacy-unique', 'session', 'unique-session',
+                         'unique memory', 'fact', 60, 80, 'normal', 'active', 1, 1, 10, 10),
+                        ('legacy-ambiguous', 'session', 'shared-session',
+                         'ambiguous memory', 'fact', 60, 80, 'normal', 'active', 1, 1, 11, 11),
+                        ('legacy-global', 'global', NULL,
+                         'global memory', 'fact', 60, 80, 'normal', 'active', 1, 1, 12, 12);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version ten should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(column_exists(&connection, "long_memory", "protocol").unwrap());
+        assert!(column_exists(&connection, "long_memory", "session_type").unwrap());
+        assert!(object_exists(&connection, "index", "idx_memory_retrieve_v11").unwrap());
+        assert!(object_exists(&connection, "index", "ux_memory_route_key_version").unwrap());
+        assert!(!object_exists(&connection, "index", "ux_memory_key_version").unwrap());
+        let routes = connection
+            .prepare(
+                "SELECT normalized_key, protocol, session_type
+                 FROM long_memory ORDER BY normalized_key",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            routes,
+            vec![
+                (
+                    "legacy-ambiguous".to_string(),
+                    "legacy".to_string(),
+                    "legacy".to_string(),
+                ),
+                (
+                    "legacy-global".to_string(),
+                    "*".to_string(),
+                    "*".to_string(),
+                ),
+                (
+                    "legacy-unique".to_string(),
+                    "onebot11".to_string(),
+                    "group".to_string(),
+                ),
+            ]
+        );
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 10);
+        assert!(!column_exists(&backup, "long_memory", "protocol").unwrap());
+        assert!(!object_exists(&backup, "index", "idx_memory_retrieve_v11").unwrap());
+        assert!(object_exists(&backup, "index", "ux_memory_key_version").unwrap());
     }
 
     #[test]

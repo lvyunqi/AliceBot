@@ -10,40 +10,74 @@ const MEMORY_HALF_LIFE_DAYS: f64 = 180.0;
 const ACCESS_HALF_LIFE_DAYS: f64 = 30.0;
 const MILLIS_PER_DAY: f64 = 86_400_000.0;
 const MAX_CANDIDATES: usize = 200;
+const LEGACY_PROTOCOL: &str = "legacy";
+const LEGACY_SESSION_TYPE: &str = "legacy";
+
+#[derive(Clone, Copy)]
+struct MemoryRoute<'a> {
+    protocol: &'a str,
+    session_type: &'a str,
+    session_id: &'a str,
+}
 
 const STRUCTURED_FILTER: &str = r#"
     lm.is_active = 1
     AND lm.status = 'active'
     AND (
-        (lm.scope = 'global' AND lm.session_id IS NULL AND lm.subject_id IS NULL)
-        OR (lm.scope = 'session' AND lm.session_id = ?1 AND lm.subject_id IS NULL)
-        OR (lm.scope = 'user' AND lm.session_id IS NULL AND lm.subject_id = ?2)
-        OR (lm.scope = 'user_session' AND lm.session_id = ?1 AND lm.subject_id = ?2)
+        (lm.scope = 'global' AND lm.session_id IS NULL AND lm.subject_id IS NULL
+            AND (lm.protocol = '*' OR lm.protocol = ?1))
+        OR (lm.scope = 'session' AND lm.protocol = ?1
+            AND lm.session_type = ?2 AND lm.session_id = ?3
+            AND lm.subject_id IS NULL)
+        OR (lm.scope = 'user' AND lm.protocol = ?1
+            AND (lm.session_type = '*' OR lm.session_type = ?2)
+            AND lm.session_id IS NULL AND lm.subject_id = ?4)
+        OR (lm.scope = 'user_session' AND lm.protocol = ?1
+            AND lm.session_type = ?2 AND lm.session_id = ?3
+            AND lm.subject_id = ?4)
     )
     AND (
         lm.privacy = 'normal'
-        OR (lm.privacy = 'session_only' AND lm.session_id = ?1)
+        OR (lm.privacy = 'session_only' AND lm.session_id = ?3
+            AND lm.protocol = ?1 AND lm.session_type = ?2)
     )
 "#;
 
 /// Retrieve high-value memories when there is no current query text.
-pub async fn retrieve_topk(session_id: &str, k: usize) -> Vec<String> {
-    retrieve_relevant(session_id, None, "", k).await
+pub async fn retrieve_topk(
+    protocol: &str,
+    session_type: &str,
+    session_id: &str,
+    k: usize,
+) -> Vec<String> {
+    retrieve_relevant(protocol, session_type, session_id, None, "", k).await
 }
 
 /// Retrieve relevant memories through FTS5/BM25 with a lexical fallback and MMR diversity.
 pub async fn retrieve_relevant(
+    protocol: &str,
+    session_type: &str,
     session_id: &str,
     subject_id: Option<&str>,
     query: &str,
     k: usize,
 ) -> Vec<String> {
     let database = db();
-    retrieve_from(&database, session_id, subject_id, query, k)
+    retrieve_from(
+        &database,
+        protocol,
+        session_type,
+        session_id,
+        subject_id,
+        query,
+        k,
+    )
 }
 
 fn retrieve_from(
     database: &crate::db::Database,
+    protocol: &str,
+    session_type: &str,
     session_id: &str,
     subject_id: Option<&str>,
     query: &str,
@@ -51,7 +85,11 @@ fn retrieve_from(
 ) -> Vec<String> {
     retrieve_from_at(
         database,
-        session_id,
+        MemoryRoute {
+            protocol,
+            session_type,
+            session_id,
+        },
         subject_id,
         query,
         k,
@@ -61,7 +99,7 @@ fn retrieve_from(
 
 fn retrieve_from_at(
     database: &crate::db::Database,
-    session_id: &str,
+    route: MemoryRoute<'_>,
     subject_id: Option<&str>,
     query: &str,
     k: usize,
@@ -80,7 +118,7 @@ fn retrieve_from_at(
         load_candidates(
             &connection,
             database.memory_search,
-            session_id,
+            route,
             subject_id,
             query,
             &query_terms,
@@ -119,7 +157,7 @@ fn retrieve_from_at(
 fn load_candidates(
     connection: &Connection,
     backend: SearchBackend,
-    session_id: &str,
+    route: MemoryRoute<'_>,
     subject_id: Option<&str>,
     query: &str,
     query_terms: &[String],
@@ -128,7 +166,7 @@ fn load_candidates(
     if backend == SearchBackend::Fts5
         && let Some(match_query) = crate::memory::search::match_query(query)
     {
-        match load_fts_candidates(connection, session_id, subject_id, &match_query, limit) {
+        match load_fts_candidates(connection, route, subject_id, &match_query, limit) {
             Ok(candidates) if !candidates.is_empty() => {
                 return Ok((candidates, RetrievalSource::Fts5));
             }
@@ -140,16 +178,16 @@ fn load_candidates(
     }
 
     let mut candidates =
-        load_lexical_candidates(connection, session_id, subject_id, query_terms, limit)?;
+        load_lexical_candidates(connection, route, subject_id, query_terms, limit)?;
     if candidates.is_empty() && !query_terms.is_empty() {
-        candidates = load_lexical_candidates(connection, session_id, subject_id, &[], limit)?;
+        candidates = load_lexical_candidates(connection, route, subject_id, &[], limit)?;
     }
     Ok((candidates, RetrievalSource::Lexical))
 }
 
 fn load_fts_candidates(
     connection: &Connection,
-    session_id: &str,
+    route: MemoryRoute<'_>,
     subject_id: Option<&str>,
     match_query: &str,
     limit: i64,
@@ -165,13 +203,20 @@ fn load_fts_candidates(
                 bm25(memory_fts)
          FROM memory_fts
          JOIN long_memory AS lm ON lm.id = memory_fts.rowid
-         WHERE memory_fts MATCH ?3 AND {STRUCTURED_FILTER}
+         WHERE memory_fts MATCH ?5 AND {STRUCTURED_FILTER}
          ORDER BY bm25(memory_fts) ASC, lm.id ASC
-         LIMIT ?4"
+         LIMIT ?6"
     );
     let mut statement = connection.prepare(&sql)?;
     let rows = statement.query_map(
-        rusqlite::params![session_id, subject_id, match_query, limit],
+        rusqlite::params![
+            route.protocol,
+            route.session_type,
+            route.session_id,
+            subject_id,
+            match_query,
+            limit
+        ],
         |row| {
             Ok(MemoryCandidate {
                 id: row.get(0)?,
@@ -196,7 +241,7 @@ fn load_fts_candidates(
 
 fn load_lexical_candidates(
     connection: &Connection,
-    session_id: &str,
+    route: MemoryRoute<'_>,
     subject_id: Option<&str>,
     query_terms: &[String],
     limit: i64,
@@ -213,7 +258,9 @@ fn load_lexical_candidates(
          WHERE {STRUCTURED_FILTER}"
     );
     let mut values = vec![
-        Value::Text(session_id.to_string()),
+        Value::Text(route.protocol.to_string()),
+        Value::Text(route.session_type.to_string()),
+        Value::Text(route.session_id.to_string()),
         subject_id
             .map(|subject| Value::Text(subject.to_string()))
             .unwrap_or(Value::Null),
@@ -223,7 +270,7 @@ fn load_lexical_candidates(
         let predicates = query_terms
             .iter()
             .enumerate()
-            .map(|(index, _)| format!("LOWER(lm.content) LIKE ?{} ESCAPE '\\'", index + 3))
+            .map(|(index, _)| format!("LOWER(lm.content) LIKE ?{} ESCAPE '\\'", index + 5))
             .collect::<Vec<_>>();
         sql.push_str(" AND (");
         sql.push_str(&predicates.join(" OR "));
@@ -420,13 +467,67 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// Store a manually supplied long-term memory with a stable source record.
+/// Store a manually supplied memory without a route.
+///
+/// The compatibility entry point uses a legacy route and is intentionally not
+/// returned to normal protocol queries. New callers should use
+/// [`store_for_route`] so persistent memory has an explicit isolation boundary.
 pub async fn store(content: &str, session_id: Option<&str>, importance: i32) -> Result<(), String> {
+    store_for_route(
+        content,
+        LEGACY_PROTOCOL,
+        LEGACY_SESSION_TYPE,
+        session_id,
+        importance,
+    )
+    .await
+}
+
+/// Store a manually supplied long-term memory with an explicit route.
+pub async fn store_for_route(
+    content: &str,
+    protocol: &str,
+    session_type: &str,
+    session_id: Option<&str>,
+    importance: i32,
+) -> Result<(), String> {
+    let database = db();
+    store_in(
+        &database,
+        content,
+        protocol,
+        session_type,
+        session_id,
+        importance,
+    )
+}
+
+fn store_in(
+    database: &crate::db::Database,
+    content: &str,
+    protocol: &str,
+    session_type: &str,
+    session_id: Option<&str>,
+    importance: i32,
+) -> Result<(), String> {
     if content.trim().is_empty() {
         return Ok(());
     }
+    let protocol = if protocol.trim().is_empty() {
+        LEGACY_PROTOCOL
+    } else {
+        protocol.trim()
+    };
+    let session_type = if session_id.is_some() {
+        if session_type.trim().is_empty() {
+            LEGACY_SESSION_TYPE
+        } else {
+            session_type.trim()
+        }
+    } else {
+        "*"
+    };
     let now = chrono::Utc::now().timestamp_millis();
-    let database = db();
     let mut connection = database
         .conn
         .lock()
@@ -440,6 +541,10 @@ pub async fn store(content: &str, session_id: Option<&str>, importance: i32) -> 
         "global"
     };
     let mut hasher = Sha256::new();
+    hasher.update(protocol.as_bytes());
+    hasher.update([0]);
+    hasher.update(session_type.as_bytes());
+    hasher.update([0]);
     hasher.update(scope.as_bytes());
     hasher.update([0]);
     hasher.update(session_id.unwrap_or_default().as_bytes());
@@ -449,14 +554,16 @@ pub async fn store(content: &str, session_id: Option<&str>, importance: i32) -> 
     transaction
         .execute(
             "INSERT INTO long_memory
-             (normalized_key, scope, session_id, content, kind, importance, confidence,
+             (normalized_key, protocol, session_type, scope, session_id, content, kind, importance, confidence,
               privacy, status, version, is_active, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 'manual', ?5, 80, 'normal', 'active', 1, 1, ?6, ?6)
-             ON CONFLICT(normalized_key, version) DO UPDATE SET
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'manual', ?7, 80, 'normal', 'active', 1, 1, ?8, ?8)
+             ON CONFLICT DO UPDATE SET
                 importance = MAX(long_memory.importance, excluded.importance),
                 updated_at = excluded.updated_at",
             rusqlite::params![
                 normalized_key,
+                protocol,
+                session_type,
                 scope,
                 session_id,
                 content.trim(),
@@ -467,8 +574,10 @@ pub async fn store(content: &str, session_id: Option<&str>, importance: i32) -> 
         .map_err(|error| error.to_string())?;
     let memory_id: i64 = transaction
         .query_row(
-            "SELECT id FROM long_memory WHERE normalized_key = ?1 AND version = 1",
-            rusqlite::params![normalized_key],
+            "SELECT id FROM long_memory
+             WHERE normalized_key = ?1 AND protocol = ?2 AND session_type = ?3
+               AND COALESCE(session_id, '') = COALESCE(?4, '') AND version = 1",
+            rusqlite::params![normalized_key, protocol, session_type, session_id],
             |row| row.get(0),
         )
         .map_err(|error| error.to_string())?;
@@ -576,18 +685,30 @@ mod tests {
     }
 
     fn insert_memory(database: &crate::db::Database, memory: TestMemory<'_>) {
+        insert_memory_for_route(database, memory, "onebot11", "group");
+    }
+
+    fn insert_memory_for_route(
+        database: &crate::db::Database,
+        memory: TestMemory<'_>,
+        protocol: &str,
+        session_type: &str,
+    ) {
         database
             .conn
             .lock()
             .unwrap()
             .execute(
                 "INSERT INTO long_memory
-                 (normalized_key, scope, session_id, subject_id, content, kind,
-                  importance, confidence, privacy, status, version, is_active,
-                  created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'fact', ?6, 85, ?7, ?8, 1, ?9, ?10, ?10)",
+                 (normalized_key, protocol, session_type, scope, session_id, subject_id,
+                  content, kind, importance, confidence, privacy, status, version,
+                  is_active, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'fact', ?8, 85, ?9, ?10,
+                         1, ?11, ?12, ?12)",
                 rusqlite::params![
                     memory.key,
+                    protocol,
+                    session_type,
                     memory.scope,
                     memory.session_id,
                     memory.subject_id,
@@ -708,7 +829,15 @@ mod tests {
             insert_memory(&database, row);
         }
 
-        let memories = retrieve_from(&database, "group-1", Some("user-1"), "", 20);
+        let memories = retrieve_from(
+            &database,
+            "onebot11",
+            "group",
+            "group-1",
+            Some("user-1"),
+            "",
+            20,
+        );
         assert!(memories.contains(&"喜欢咖啡".to_string()));
         assert!(memories.contains(&"群公告周五开会".to_string()));
         assert!(memories.contains(&"仅本会话可见".to_string()));
@@ -717,6 +846,111 @@ mod tests {
         assert!(!memories.contains(&"已经遗忘".to_string()));
         assert!(!memories.contains(&"敏感记忆".to_string()));
         assert!(!memories.contains(&"其他会话私有".to_string()));
+    }
+
+    #[test]
+    fn retrieval_isolates_identical_ids_by_protocol_and_session_type() {
+        let database = crate::db::Database::open(":memory:").unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let rows = [
+            ("onebot", "onebot11", "group", "OneBot 群记忆"),
+            ("official", "qq-official", "group", "官方 QQ 群记忆"),
+            ("private", "onebot11", "private", "OneBot 私聊记忆"),
+        ];
+        for (key, protocol, session_type, content) in rows {
+            insert_memory_for_route(
+                &database,
+                TestMemory {
+                    key,
+                    scope: "user_session",
+                    session_id: Some("same-session-id"),
+                    subject_id: Some("same-user-id"),
+                    content,
+                    privacy: "normal",
+                    status: "active",
+                    active: true,
+                    importance: 70,
+                    created_at: now,
+                },
+                protocol,
+                session_type,
+            );
+        }
+
+        let onebot_group = retrieve_from(
+            &database,
+            "onebot11",
+            "group",
+            "same-session-id",
+            Some("same-user-id"),
+            "",
+            10,
+        );
+        let official_group = retrieve_from(
+            &database,
+            "qq-official",
+            "group",
+            "same-session-id",
+            Some("same-user-id"),
+            "",
+            10,
+        );
+        let onebot_private = retrieve_from(
+            &database,
+            "onebot11",
+            "private",
+            "same-session-id",
+            Some("same-user-id"),
+            "",
+            10,
+        );
+
+        assert_eq!(onebot_group, vec!["OneBot 群记忆"]);
+        assert_eq!(official_group, vec!["官方 QQ 群记忆"]);
+        assert_eq!(onebot_private, vec!["OneBot 私聊记忆"]);
+    }
+
+    #[test]
+    fn manual_store_keys_include_the_explicit_route() {
+        let database = crate::db::Database::open(":memory:").unwrap();
+        store_in(
+            &database,
+            "同一条手工记忆",
+            "onebot11",
+            "group",
+            Some("same-session-id"),
+            70,
+        )
+        .unwrap();
+        store_in(
+            &database,
+            "同一条手工记忆",
+            "onebot11",
+            "group",
+            Some("same-session-id"),
+            80,
+        )
+        .unwrap();
+        store_in(
+            &database,
+            "同一条手工记忆",
+            "qq-official",
+            "group",
+            Some("same-session-id"),
+            70,
+        )
+        .unwrap();
+
+        let connection = database.conn.lock().unwrap();
+        let (count, keys, max_importance): (i64, i64, i32) = connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT normalized_key), MAX(importance)
+                 FROM long_memory",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((count, keys, max_importance), (2, 2, 80));
     }
 
     #[test]
@@ -757,7 +991,15 @@ mod tests {
             },
         );
 
-        let memories = retrieve_from(&database, "group-1", None, "ownership borrowing", 1);
+        let memories = retrieve_from(
+            &database,
+            "onebot11",
+            "group",
+            "group-1",
+            None,
+            "ownership borrowing",
+            1,
+        );
         assert_eq!(memories, vec!["Rust ownership borrowing and memory safety"]);
     }
 
@@ -797,7 +1039,7 @@ mod tests {
             },
         );
 
-        let memories = retrieve_from(&database, "group-1", None, "咖啡", 1);
+        let memories = retrieve_from(&database, "onebot11", "group", "group-1", None, "咖啡", 1);
         assert_eq!(memories, vec!["大家约好周末去喝咖啡"]);
     }
 
@@ -835,7 +1077,15 @@ mod tests {
             )
             .unwrap();
 
-        let memories = retrieve_from(&database, "group-1", None, "fallback retrieval", 1);
+        let memories = retrieve_from(
+            &database,
+            "onebot11",
+            "group",
+            "group-1",
+            None,
+            "fallback retrieval",
+            1,
+        );
         assert_eq!(memories, vec!["fallback retrieval remains available"]);
     }
 

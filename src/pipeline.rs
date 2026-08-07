@@ -591,6 +591,8 @@ async fn generate_reply(msg: &InMessage, source_event_keys: &[String]) -> Result
         Vec::new()
     } else {
         memory::long::retrieve_relevant(
+            &msg.protocol,
+            &msg.session_type,
             &msg.session_id,
             Some(&msg.sender_id),
             &content,

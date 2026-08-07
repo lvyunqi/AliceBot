@@ -211,8 +211,9 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO long_memory
-                 (normalized_key, scope, session_id, content, status, is_active, created_at)
-                 VALUES ('repair-test', 'session', 'group-1',
+                 (normalized_key, protocol, session_type, scope, session_id,
+                  content, status, is_active, created_at)
+                 VALUES ('repair-test', 'onebot11', 'group', 'session', 'group-1',
                          'repairable searchable memory', 'active', 1, 10)",
                 [],
             )

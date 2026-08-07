@@ -66,12 +66,12 @@ fn apply(
     let mut stats = UpdateStats::default();
 
     for candidate in candidates {
-        if has_forgotten_tombstone(&transaction, &candidate.normalized_key)? {
+        if has_forgotten_tombstone(&transaction, &candidate.normalized_key, msg)? {
             stats.blocked_by_tombstone += 1;
             continue;
         }
 
-        let existing = latest_memory(&transaction, &candidate.normalized_key)?;
+        let existing = latest_memory(&transaction, &candidate.normalized_key, msg)?;
         match existing {
             Some(existing) if existing.content == candidate.content => {
                 let source_inserted = insert_source(&transaction, existing.id, msg, now)?;
@@ -110,6 +110,7 @@ fn apply(
                     supersede_other_versions(
                         &transaction,
                         &candidate.normalized_key,
+                        msg,
                         existing.id,
                         now,
                     )?;
@@ -129,13 +130,15 @@ fn apply(
                 transaction
                     .execute(
                         "INSERT INTO long_memory
-                         (normalized_key, scope, session_id, subject_id, content, kind,
-                          importance, confidence, privacy, status, version, is_active,
-                          created_at, updated_at)
-                         VALUES (?1, 'user_session', ?2, ?3, ?4, ?5, ?6, ?7,
-                                 'normal', ?8, ?9, ?10, ?11, ?11)",
+                         (normalized_key, protocol, session_type, scope, session_id, subject_id,
+                          content, kind, importance, confidence, privacy, status, version,
+                          is_active, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'user_session', ?4, ?5, ?6, ?7, ?8, ?9,
+                                 'normal', ?10, ?11, ?12, ?13, ?13)",
                         params![
                             candidate.normalized_key,
+                            msg.protocol,
+                            msg.session_type,
                             msg.session_id,
                             msg.sender_id,
                             candidate.content,
@@ -156,6 +159,7 @@ fn apply(
                     supersede_other_versions(
                         &transaction,
                         &candidate.normalized_key,
+                        msg,
                         memory_id,
                         now,
                     )?;
@@ -172,12 +176,23 @@ fn apply(
 fn has_forgotten_tombstone(
     transaction: &Transaction<'_>,
     normalized_key: &str,
+    msg: &InMessage,
 ) -> Result<bool, String> {
     transaction
         .query_row(
             "SELECT 1 FROM long_memory
-             WHERE normalized_key = ?1 AND status = 'forgotten' LIMIT 1",
-            params![normalized_key],
+             WHERE normalized_key = ?1 AND status = 'forgotten'
+               AND (
+                    (protocol = ?2 AND session_type = ?3 AND session_id = ?4)
+                    OR protocol = 'legacy'
+               )
+             LIMIT 1",
+            params![
+                normalized_key,
+                msg.protocol,
+                msg.session_type,
+                msg.session_id
+            ],
             |_| Ok(()),
         )
         .optional()
@@ -188,13 +203,21 @@ fn has_forgotten_tombstone(
 fn latest_memory(
     transaction: &Transaction<'_>,
     normalized_key: &str,
+    msg: &InMessage,
 ) -> Result<Option<ExistingMemory>, String> {
     transaction
         .query_row(
             "SELECT id, content, importance, confidence, status, version
-             FROM long_memory WHERE normalized_key = ?1
+             FROM long_memory
+             WHERE normalized_key = ?1 AND protocol = ?2
+               AND session_type = ?3 AND session_id = ?4
              ORDER BY version DESC LIMIT 1",
-            params![normalized_key],
+            params![
+                normalized_key,
+                msg.protocol,
+                msg.session_type,
+                msg.session_id
+            ],
             |row| {
                 Ok(ExistingMemory {
                     id: row.get(0)?,
@@ -230,6 +253,7 @@ fn insert_source(
 fn supersede_other_versions(
     transaction: &Transaction<'_>,
     normalized_key: &str,
+    msg: &InMessage,
     active_id: i64,
     now: i64,
 ) -> Result<(), String> {
@@ -239,8 +263,16 @@ fn supersede_other_versions(
              SET status = 'superseded', is_active = 0, superseded_by = ?1,
                  updated_at = ?2
              WHERE normalized_key = ?3 AND id <> ?1
+               AND protocol = ?4 AND session_type = ?5 AND session_id = ?6
                AND status IN ('candidate', 'active')",
-            params![active_id, now, normalized_key],
+            params![
+                active_id,
+                now,
+                normalized_key,
+                msg.protocol,
+                msg.session_type,
+                msg.session_id
+            ],
         )
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -472,6 +504,42 @@ mod tests {
     }
 
     #[test]
+    fn candidates_with_identical_ids_remain_route_scoped() {
+        let database = Database::open(":memory:").unwrap();
+        let onebot = message("memory:route:onebot", "我叫小林。", 10);
+        let mut official = message("memory:route:official", "我叫小林。", 20);
+        official.protocol = "qq-official".to_string();
+        let mut private = message("memory:route:private", "我叫小林。", 30);
+        private.session_type = "private".to_string();
+
+        for item in [&onebot, &official, &private] {
+            assert_eq!(apply(&database, item, &extract(item)).unwrap().inserted, 1);
+        }
+
+        let connection = database.conn.lock().unwrap();
+        let routes = connection
+            .prepare(
+                "SELECT protocol, session_type FROM long_memory
+                 ORDER BY protocol, session_type",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            routes,
+            vec![
+                ("onebot11".to_string(), "group".to_string()),
+                ("onebot11".to_string(), "private".to_string()),
+                ("qq-official".to_string(), "group".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn high_confidence_name_change_supersedes_previous_version() {
         let database = Database::open(":memory:").unwrap();
         let first = message("memory:name:1", "我叫小林。", 10);
@@ -524,6 +592,18 @@ mod tests {
 
         let stats = apply(&database, &second, &extract(&second)).unwrap();
         assert_eq!(stats.blocked_by_tombstone, 1);
+        database
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE long_memory SET protocol = 'legacy', session_type = 'legacy'",
+                [],
+            )
+            .unwrap();
+        let third = message("memory:forgotten:3", "我喜欢薄荷。", 30);
+        let legacy_stats = apply(&database, &third, &extract(&third)).unwrap();
+        assert_eq!(legacy_stats.blocked_by_tombstone, 1);
         let connection = database.conn.lock().unwrap();
         let count: i64 = connection
             .query_row("SELECT COUNT(*) FROM long_memory", [], |row| row.get(0))

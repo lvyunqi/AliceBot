@@ -70,16 +70,24 @@ pub async fn run_if_due(config: &AppConfig) -> Result<usize, String> {
                 "会话摘要：本批包含 {} 条消息，时间范围 {} 到 {}。代表性片段：{}",
                 batch.count, batch.first_at, batch.last_at, samples
             );
-            let normalized_key = summary_key(&run_key, &batch.session_id);
+            let normalized_key = summary_key(
+                &run_key,
+                &batch.protocol,
+                &batch.session_type,
+                &batch.session_id,
+            );
             transaction
                 .execute(
                     "INSERT INTO long_memory
-                     (normalized_key, scope, session_id, content, kind, importance,
-                      confidence, privacy, status, version, is_active, created_at, updated_at)
-                     VALUES (?1, 'session', ?2, ?3, 'conversation_summary', ?4,
-                             80, 'normal', 'active', 1, 1, ?5, ?5)",
+                     (normalized_key, protocol, session_type, scope, session_id, content,
+                      kind, importance, confidence, privacy, status, version, is_active,
+                      created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'session', ?4, ?5, 'conversation_summary', ?6,
+                             80, 'normal', 'active', 1, 1, ?7, ?7)",
                     rusqlite::params![
                         normalized_key,
+                        batch.protocol,
+                        batch.session_type,
                         batch.session_id,
                         summary,
                         i32::try_from(config.memories.importance_threshold)
@@ -151,9 +159,13 @@ pub async fn run_if_due(config: &AppConfig) -> Result<usize, String> {
     Ok(processed_count as usize)
 }
 
-fn summary_key(run_key: &str, session_id: &str) -> String {
+fn summary_key(run_key: &str, protocol: &str, session_type: &str, session_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(run_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(protocol.as_bytes());
+    hasher.update([0]);
+    hasher.update(session_type.as_bytes());
     hasher.update([0]);
     hasher.update(session_id.as_bytes());
     let digest = hasher.finalize();
@@ -185,10 +197,11 @@ fn load_batches(
         .map_err(|_| "database lock failed".to_string())?;
     let mut statement = connection
         .prepare(
-            "SELECT session_id, COUNT(*), MIN(created_at), MAX(created_at)
+            "SELECT protocol, session_type, session_id,
+                    COUNT(*), MIN(created_at), MAX(created_at)
              FROM messages
              WHERE id > ?1 AND id <= ?2 AND direction = 'inbound'
-             GROUP BY session_id
+             GROUP BY protocol, session_type, session_id
              ORDER BY COUNT(*) DESC",
         )
         .map_err(|error| error.to_string())?;
@@ -196,37 +209,43 @@ fn load_batches(
         .query_map(rusqlite::params![cursor, end_cursor], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })
         .map_err(|error| error.to_string())?;
     let groups = rows
         .filter_map(Result::ok)
-        .collect::<Vec<(String, i64, i64, i64)>>();
+        .collect::<Vec<(String, String, String, i64, i64, i64)>>();
     drop(statement);
 
     let mut batches = Vec::new();
-    for (session_id, count, first_at, last_at) in groups {
+    for (protocol, session_type, session_id, count, first_at, last_at) in groups {
         let mut sample_statement = connection
             .prepare(
                 "SELECT content FROM messages
-                 WHERE session_id = ?1 AND id > ?2 AND id <= ?3
+                 WHERE protocol = ?1 AND session_type = ?2 AND session_id = ?3
+                   AND id > ?4 AND id <= ?5
                    AND direction = 'inbound' AND TRIM(content) <> ''
                  ORDER BY id DESC LIMIT 6",
             )
             .map_err(|error| error.to_string())?;
         let sample_rows = sample_statement
-            .query_map(rusqlite::params![session_id, cursor, end_cursor], |row| {
-                row.get::<_, String>(0)
-            })
+            .query_map(
+                rusqlite::params![protocol, session_type, session_id, cursor, end_cursor],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(|error| error.to_string())?;
         let samples = sample_rows
             .filter_map(Result::ok)
             .map(|sample| sample.chars().take(120).collect::<String>())
             .collect::<Vec<_>>();
         batches.push(SessionBatch {
+            protocol,
+            session_type,
             session_id,
             count,
             first_at,
@@ -238,6 +257,8 @@ fn load_batches(
 }
 
 struct SessionBatch {
+    protocol: String,
+    session_type: String,
     session_id: String,
     count: i64,
     first_at: i64,
@@ -284,13 +305,32 @@ mod tests {
                 safe_raw_json: "{}".to_string(),
             })
             .expect("message should insert");
+        database
+            .insert_message(&crate::pipeline::InMessage {
+                event_key: "compact:event-2".to_string(),
+                protocol: "qq-official".to_string(),
+                bot_account_id: String::new(),
+                session_type: "group".to_string(),
+                session_id: "group-compact".to_string(),
+                sender_id: "user-2".to_string(),
+                sender_name: "user".to_string(),
+                message_id: "message-2".to_string(),
+                reply_to_id: String::new(),
+                content: "same platform ID, different protocol".to_string(),
+                media: Vec::new(),
+                has_media: false,
+                at_me: false,
+                timestamp: 2_000,
+                safe_raw_json: "{}".to_string(),
+            })
+            .expect("second protocol message should insert");
         crate::pipeline::set_db(database);
 
         let mut config = AppConfig::default();
         config.memories.compress_min_messages = 1;
         assert_eq!(
             run_if_due(&config).await.expect("compaction should work"),
-            1
+            2
         );
         let database = crate::pipeline::try_db().expect("database should remain installed");
         let connection = database.conn.lock().expect("database lock should work");
@@ -301,7 +341,26 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("summary should exist");
-        assert_eq!(summary_count, 1);
+        assert_eq!(summary_count, 2);
+        let routes = connection
+            .prepare(
+                "SELECT protocol, session_type FROM long_memory
+                 WHERE kind = 'conversation_summary' ORDER BY protocol",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            routes,
+            vec![
+                ("onebot11".to_string(), "group".to_string()),
+                ("qq-official".to_string(), "group".to_string()),
+            ]
+        );
         let source_count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM memory_sources WHERE source_type = 'reflection'",
@@ -309,11 +368,11 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("summary source should exist");
-        assert_eq!(source_count, 1);
+        assert_eq!(source_count, 2);
         drop(connection);
         assert_eq!(
             database.get_meta("compaction_cursor").unwrap().as_deref(),
-            Some("1")
+            Some("2")
         );
         crate::pipeline::clear_db();
         drop(database);
