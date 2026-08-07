@@ -42,6 +42,19 @@ impl InboundEvent {
             timestamp: req.timestamp,
         }
     }
+
+    /// 从命令 ABI 请求复制可跨异步边界的路由和身份字段。
+    fn from_command(req: &CommandRequest, message_text: &str) -> Self {
+        Self {
+            sender_id: req.sender_id.as_str().to_owned(),
+            group_id: req.group_id.as_str().to_owned(),
+            message_text: message_text.to_owned(),
+            raw_event_json: req.raw_event_json.as_str().to_owned(),
+            sender_nickname: req.sender_nickname.as_str().to_owned(),
+            message_id: req.message_id.as_str().to_owned(),
+            timestamp: req.timestamp,
+        }
+    }
 }
 
 /// 规范化的媒体引用。当前入站图片/表情主要是 URL，不在消息回调中下载。
@@ -72,8 +85,31 @@ pub struct InMessage {
     pub safe_raw_json: String,
 }
 
+/// 已从同步命令回调复制出来的 `/ask` 后台任务。
+#[derive(Debug, Clone)]
+pub(crate) struct DirectAskTask {
+    pub(crate) message: InMessage,
+    pub(crate) prompt: String,
+}
+
+impl DirectAskTask {
+    /// 从命令请求创建任务，空参数不进入后台队列。
+    pub fn from_command(req: &CommandRequest) -> Option<Self> {
+        let prompt = req.args.as_str().trim();
+        if prompt.is_empty() {
+            return None;
+        }
+        let event = InboundEvent::from_command(req, prompt);
+        Some(Self {
+            message: normalize_message(&event),
+            prompt: prompt.to_owned(),
+        })
+    }
+}
+
 static DB: OnceLock<Mutex<Option<Arc<Database>>>> = OnceLock::new();
 static STATE: OnceLock<Mutex<Option<Arc<PipelineState>>>> = OnceLock::new();
+static COMMAND_SUPPRESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 struct PipelineState {
     config: AppConfig,
@@ -86,6 +122,10 @@ fn db_slot() -> &'static Mutex<Option<Arc<Database>>> {
 
 fn state_slot() -> &'static Mutex<Option<Arc<PipelineState>>> {
     STATE.get_or_init(|| Mutex::new(None))
+}
+
+fn command_suppression_slot() -> &'static Mutex<HashSet<String>> {
+    COMMAND_SUPPRESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 pub fn set_config(config: AppConfig) {
@@ -101,6 +141,34 @@ pub fn set_config(config: AppConfig) {
 pub fn clear_config() {
     if let Ok(mut slot) = state_slot().lock() {
         *slot = None;
+    }
+}
+
+/// 标记当前命令事件，after_completion 只保留 journal，不再触发自主回复。
+pub fn suppress_autonomous_reply_for_command(req: &CommandRequest) {
+    let event = InboundEvent::from_command(req, req.args.as_str());
+    let event_key = normalize_message(&event).event_key;
+    if let Ok(mut suppressions) = command_suppression_slot().lock() {
+        // 防止异常宿主重复命令造成进程内抑制集合无界增长。
+        if suppressions.len() >= 256 {
+            suppressions.clear();
+        }
+        suppressions.insert(event_key);
+    }
+}
+
+/// 消费一次命令事件抑制标记，确保后续普通消息不受影响。
+pub fn take_command_suppression(event_key: &str) -> bool {
+    command_suppression_slot()
+        .lock()
+        .map(|mut suppressions| suppressions.remove(event_key))
+        .unwrap_or(false)
+}
+
+/// reload/shutdown 后清除旧实例的命令事件标记。
+pub fn clear_command_suppressions() {
+    if let Ok(mut suppressions) = command_suppression_slot().lock() {
+        suppressions.clear();
     }
 }
 
@@ -699,8 +767,36 @@ async fn generate_reply(msg: &InMessage, source_event_keys: &[String]) -> Result
         .map_err(|error| format!("{:?}", error.kind))
 }
 
-/// 直接提问（/ask 命令）。
-pub async fn direct_ask(text: &str, _req: &CommandRequest) -> String {
+/// 在后台执行 `/ask`，并通过稳定账号把最终文本发送回原会话。
+pub(crate) async fn process_direct_ask(task: DirectAskTask) {
+    let message = task.message;
+    let reply = direct_ask(&task.prompt).await;
+    let source_event_key = format!("{}:direct_ask", message.event_key);
+    if send::send_text_for_event(
+        &message.bot_account_id,
+        &message.protocol,
+        &message.session_id,
+        &message.session_type,
+        &reply,
+        Some(&source_event_key),
+    )
+    .await
+    {
+        let sent_at = chrono::Utc::now().timestamp_millis();
+        memory::push_short_context(&message).await;
+        memory::push_assistant_context(
+            &message.protocol,
+            &message.session_type,
+            &message.session_id,
+            &reply,
+            sent_at,
+        )
+        .await;
+    }
+}
+
+/// 生成 `/ask` 的最终文本；该函数只在 runtime 的后台任务中调用。
+async fn direct_ask(text: &str) -> String {
     let Some(state) = state() else {
         return "我还没有初始化好，等一下再问我吧～".to_string();
     };
@@ -993,5 +1089,71 @@ mod tests {
         assert_eq!(message.content, "宿主规范文本");
         assert_eq!(message.timestamp, 1_722_963_744_000);
         assert_eq!(message.safe_raw_json, "{}");
+    }
+
+    #[test]
+    fn direct_ask_task_copies_command_route_and_uses_arguments_as_prompt() {
+        let request = CommandRequest {
+            args: "命令参数".into(),
+            command_name: "ask".into(),
+            sender_id: "member-1".into(),
+            group_id: "group-1".into(),
+            raw_event_json: r#"{
+                "post_type":"message",
+                "message_id":"command-1",
+                "group_id":"group-1",
+                "user_id":"member-1",
+                "qimen_context":{"version":1,"protocol":"onebot11","bot_instance":"onebot-main","account_id":"bot-account"}
+            }"#
+            .into(),
+            sender_nickname: "测试用户".into(),
+            message_id: "command-1".into(),
+            timestamp: 1_722_963_744,
+        };
+
+        let task = DirectAskTask::from_command(&request).expect("command arguments should queue");
+        assert_eq!(task.prompt, "命令参数");
+        assert_eq!(task.message.content, "命令参数");
+        assert_eq!(task.message.event_key, "onebot11:command-1");
+        assert_eq!(task.message.bot_account_id, "bot-account");
+        assert_eq!(task.message.session_type, "group");
+        assert_eq!(task.message.session_id, "group-1");
+    }
+
+    #[test]
+    fn command_suppression_is_consumed_once() {
+        clear_command_suppressions();
+        let request = CommandRequest {
+            args: "问题".into(),
+            command_name: "ask".into(),
+            sender_id: "user-1".into(),
+            group_id: String::new().into(),
+            raw_event_json: r#"{
+                "message_id":"command-2",
+                "user_id":"user-1",
+                "qimen_context":{"version":1,"protocol":"onebot11","account_id":"bot-account"}
+            }"#
+            .into(),
+            sender_nickname: "测试用户".into(),
+            message_id: "command-2".into(),
+            timestamp: 1_722_963_744,
+        };
+        let task = DirectAskTask::from_command(&request).expect("command should build task");
+        let interceptor_event = inbound_event(InterceptorRequest {
+            bot_id: "onebot-main".into(),
+            sender_id: "user-1".into(),
+            group_id: String::new().into(),
+            message_text: "/ask 问题".into(),
+            raw_event_json: request.raw_event_json.clone(),
+            sender_nickname: "测试用户".into(),
+            message_id: "command-2".into(),
+            timestamp: 1_722_963_744,
+        });
+        let interceptor_event_key = normalize_message(&interceptor_event).event_key;
+        assert_eq!(task.message.event_key, interceptor_event_key);
+
+        suppress_autonomous_reply_for_command(&request);
+        assert!(take_command_suppression(&interceptor_event_key));
+        assert!(!take_command_suppression(&interceptor_event_key));
     }
 }

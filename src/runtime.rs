@@ -11,10 +11,12 @@ use tokio::sync::{Notify, Semaphore, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::AppConfig;
-use crate::pipeline::InMessage;
+use crate::pipeline::{DirectAskTask, InMessage};
 
 const MESSAGE_QUEUE_CAPACITY: usize = 1024;
 const MESSAGE_CONCURRENCY: usize = 32;
+const DIRECT_ASK_QUEUE_CAPACITY: usize = 32;
+const DIRECT_ASK_CONCURRENCY: usize = 4;
 
 struct RuntimeState {
     runtime: Option<Runtime>,
@@ -22,6 +24,7 @@ struct RuntimeState {
     stop_notify: Arc<Notify>,
     background_tasks: Vec<JoinHandle<()>>,
     message_sender: Option<mpsc::Sender<InMessage>>,
+    direct_ask_sender: Option<mpsc::Sender<DirectAskTask>>,
 }
 
 /// 可重复启动和关闭的插件 runtime。
@@ -38,6 +41,7 @@ impl PluginRuntime {
                 stop_notify: Arc::new(Notify::new()),
                 background_tasks: Vec::new(),
                 message_sender: None,
+                direct_ask_sender: None,
             }),
         }
     }
@@ -54,14 +58,21 @@ impl PluginRuntime {
             state.shutdown = Arc::new(AtomicBool::new(false));
             state.stop_notify = Arc::new(Notify::new());
             let (sender, receiver) = mpsc::channel(MESSAGE_QUEUE_CAPACITY);
-            let worker = runtime.handle().spawn(message_dispatcher(
+            let message_worker = runtime.handle().spawn(message_dispatcher(
                 receiver,
                 state.shutdown.clone(),
                 state.stop_notify.clone(),
             ));
+            let (direct_ask_sender, direct_ask_receiver) = mpsc::channel(DIRECT_ASK_QUEUE_CAPACITY);
+            let direct_ask_worker = runtime.handle().spawn(direct_ask_dispatcher(
+                direct_ask_receiver,
+                state.shutdown.clone(),
+                state.stop_notify.clone(),
+            ));
             state.runtime = Some(runtime);
-            state.background_tasks = vec![worker];
+            state.background_tasks = vec![message_worker, direct_ask_worker];
             state.message_sender = Some(sender);
+            state.direct_ask_sender = Some(direct_ask_sender);
         } else {
             state.shutdown.store(false, Ordering::Release);
         }
@@ -96,6 +107,17 @@ impl PluginRuntime {
             return MessageSubmitResult::Unavailable;
         };
         try_submit_message(sender, message)
+    }
+
+    /// 将 `/ask` 放入独立有界队列，避免同步 FFI 回调等待模型网络请求。
+    pub fn submit_direct_ask(&self, task: DirectAskTask) -> DirectAskSubmitResult {
+        let Ok(state) = self.state.lock() else {
+            return DirectAskSubmitResult::Unavailable;
+        };
+        let Some(sender) = state.direct_ask_sender.as_ref() else {
+            return DirectAskSubmitResult::Unavailable;
+        };
+        try_submit_direct_ask(sender, task)
     }
 
     /// 启动后台任务（压缩、反思等）。
@@ -177,21 +199,24 @@ impl PluginRuntime {
 
     /// 停止后台任务并销毁 runtime，保证动态库卸载前不再执行插件代码。
     pub fn shutdown(&self) {
-        let (runtime, tasks, shutdown, stop_notify, message_sender) = match self.state.lock() {
-            Ok(mut state) => {
-                state.shutdown.store(true, Ordering::Release);
-                (
-                    state.runtime.take(),
-                    std::mem::take(&mut state.background_tasks),
-                    state.shutdown.clone(),
-                    state.stop_notify.clone(),
-                    state.message_sender.take(),
-                )
-            }
-            Err(_) => return,
-        };
+        let (runtime, tasks, shutdown, stop_notify, message_sender, direct_ask_sender) =
+            match self.state.lock() {
+                Ok(mut state) => {
+                    state.shutdown.store(true, Ordering::Release);
+                    (
+                        state.runtime.take(),
+                        std::mem::take(&mut state.background_tasks),
+                        state.shutdown.clone(),
+                        state.stop_notify.clone(),
+                        state.message_sender.take(),
+                        state.direct_ask_sender.take(),
+                    )
+                }
+                Err(_) => return,
+            };
 
         drop(message_sender);
+        drop(direct_ask_sender);
         shutdown.store(true, Ordering::Release);
         stop_notify.notify_waiters();
         let Some(runtime) = runtime else {
@@ -214,11 +239,30 @@ pub enum MessageSubmitResult {
     Unavailable,
 }
 
+/// `/ask` 队列提交结果，供命令回调返回即时可理解的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectAskSubmitResult {
+    Enqueued,
+    Full,
+    Unavailable,
+}
+
 fn try_submit_message(sender: &mpsc::Sender<InMessage>, message: InMessage) -> MessageSubmitResult {
     match sender.try_send(message) {
         Ok(()) => MessageSubmitResult::Enqueued,
         Err(mpsc::error::TrySendError::Full(_)) => MessageSubmitResult::Full,
         Err(mpsc::error::TrySendError::Closed(_)) => MessageSubmitResult::Unavailable,
+    }
+}
+
+fn try_submit_direct_ask(
+    sender: &mpsc::Sender<DirectAskTask>,
+    task: DirectAskTask,
+) -> DirectAskSubmitResult {
+    match sender.try_send(task) {
+        Ok(()) => DirectAskSubmitResult::Enqueued,
+        Err(mpsc::error::TrySendError::Full(_)) => DirectAskSubmitResult::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => DirectAskSubmitResult::Unavailable,
     }
 }
 
@@ -272,6 +316,53 @@ async fn message_dispatcher(
     }
 }
 
+/// 有界执行后台 `/ask`，关闭时取消未完成任务，避免动态库卸载后继续发送。
+async fn direct_ask_dispatcher(
+    mut receiver: mpsc::Receiver<DirectAskTask>,
+    shutdown: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
+) {
+    let permits = Arc::new(Semaphore::new(DIRECT_ASK_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+
+    loop {
+        while tasks.try_join_next().is_some() {}
+        let permit = tokio::select! {
+            _ = stop_notify.notified() => break,
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let next_task = tokio::select! {
+            _ = stop_notify.notified() => break,
+            task = receiver.recv() => task,
+        };
+        let Some(task) = next_task else {
+            break;
+        };
+
+        let task_shutdown = shutdown.clone();
+        let task_notify = stop_notify.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            if task_shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::select! {
+                _ = task_notify.notified() => {}
+                _ = crate::pipeline::process_direct_ask(task) => {}
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            log::debug!("[AliceBot] /ask worker stopped: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,6 +392,27 @@ mod tests {
             try_submit_message(&sender, message),
             MessageSubmitResult::Full
         );
+    }
+
+    #[test]
+    fn bounded_direct_ask_sender_reports_full_without_dropping_contract() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let task = test_direct_ask();
+        assert_eq!(
+            try_submit_direct_ask(&sender, task.clone()),
+            DirectAskSubmitResult::Enqueued
+        );
+        assert_eq!(
+            try_submit_direct_ask(&sender, task),
+            DirectAskSubmitResult::Full
+        );
+    }
+
+    fn test_direct_ask() -> DirectAskTask {
+        DirectAskTask {
+            message: test_message("ask-1"),
+            prompt: "test".to_string(),
+        }
     }
 
     fn test_message(event_key: &str) -> InMessage {

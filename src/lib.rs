@@ -28,28 +28,35 @@ pub mod stickers;
 static RUNTIME: std::sync::LazyLock<runtime::PluginRuntime> =
     std::sync::LazyLock::new(runtime::PluginRuntime::new);
 
-/// 在动态拦截器回调内先写入 journal，再把自有消息提交给异步处理队列。
+/// 在命令处理完成后写入 journal，并把非命令消息提交给异步处理队列。
 fn accept_inbound_message(req: &InterceptorRequest) {
     let rt = &*RUNTIME;
     let event = pipeline::InboundEvent::from_request(req);
     match pipeline::record_inbound(event) {
-        Ok(Some(message)) => match rt.submit_message(message.clone()) {
-            runtime::MessageSubmitResult::Enqueued => {}
-            runtime::MessageSubmitResult::Full => {
-                pipeline::mark_record_only(&message.event_key, "queue_full");
-                log::warn!(
-                    "[AliceBot] 入站处理队列已满，保留 record_only event_key={}",
-                    message.event_key
-                );
+        Ok(Some(message)) => {
+            if pipeline::take_command_suppression(&message.event_key) {
+                pipeline::mark_record_only(&message.event_key, "command_handled");
+                return;
             }
-            runtime::MessageSubmitResult::Unavailable => {
-                pipeline::mark_record_only(&message.event_key, "runtime_unavailable");
-                log::warn!(
-                    "[AliceBot] runtime 不可用，保留 record_only event_key={}",
-                    message.event_key
-                );
+
+            match rt.submit_message(message.clone()) {
+                runtime::MessageSubmitResult::Enqueued => {}
+                runtime::MessageSubmitResult::Full => {
+                    pipeline::mark_record_only(&message.event_key, "queue_full");
+                    log::warn!(
+                        "[AliceBot] 入站处理队列已满，保留 record_only event_key={}",
+                        message.event_key
+                    );
+                }
+                runtime::MessageSubmitResult::Unavailable => {
+                    pipeline::mark_record_only(&message.event_key, "runtime_unavailable");
+                    log::warn!(
+                        "[AliceBot] runtime 不可用，保留 record_only event_key={}",
+                        message.event_key
+                    );
+                }
             }
-        },
+        }
         Ok(None) => {}
         Err(error) => {
             log::error!("[AliceBot] 入站消息 journal 失败: {error}");
@@ -144,6 +151,7 @@ mod plugin {
         rt.shutdown();
         decision::clear_runtime_state();
         memory::clear_runtime_state();
+        pipeline::clear_command_suppressions();
         pipeline::clear_db();
         pipeline::clear_config();
         log::info!("[AliceBot] 已关闭");
@@ -152,10 +160,14 @@ mod plugin {
     // ── 消息拦截 (pre_handle) ──────────────────────────────────
 
     #[pre_handle]
-    fn pre_handle(req: &InterceptorRequest) -> InterceptorResponse {
-        // 普通消息只会经过拦截器链；notice route 不会收到群聊或私聊消息。
-        accept_inbound_message(req);
+    fn pre_handle(_req: &InterceptorRequest) -> InterceptorResponse {
+        // 命令回调会在 after_completion 之前运行，届时才能可靠地抑制自主回复。
         InterceptorResponse::allow()
+    }
+
+    #[after_completion]
+    fn after_completion(req: &InterceptorRequest) {
+        accept_inbound_message(req);
     }
 
     // ── 命令 ───────────────────────────────────────────────────
@@ -167,14 +179,23 @@ mod plugin {
         category = "ai"
     )]
     fn cmd_ask(req: &CommandRequest) -> CommandResponse {
-        let text = req.args.as_str();
-        if text.is_empty() {
+        pipeline::suppress_autonomous_reply_for_command(req);
+        let Some(task) = pipeline::DirectAskTask::from_command(req) else {
             return CommandResponse::text("想问什么呀～直接说就行");
-        }
+        };
 
         let rt = &*RUNTIME;
-        let reply = rt.block_on(async { pipeline::direct_ask(text, req).await });
-        CommandResponse::text(&reply)
+        match rt.submit_direct_ask(task) {
+            runtime::DirectAskSubmitResult::Enqueued => {
+                CommandResponse::text("收到啦，我想一下再回复你～")
+            }
+            runtime::DirectAskSubmitResult::Full => {
+                CommandResponse::text("我这会儿有点忙，等一下再问我吧～")
+            }
+            runtime::DirectAskSubmitResult::Unavailable => {
+                CommandResponse::text("我还没有初始化好，等一下再问我吧～")
+            }
+        }
     }
 
     #[command(
@@ -184,6 +205,7 @@ mod plugin {
         category = "ai"
     )]
     fn cmd_forget(req: &CommandRequest) -> CommandResponse {
+        pipeline::suppress_autonomous_reply_for_command(req);
         let text = req.args.as_str();
         if text.is_empty() {
             return CommandResponse::text("想让我忘记什么呀？说个关键词～");
@@ -200,7 +222,8 @@ mod plugin {
         aliases = "状态,stats",
         category = "tools"
     )]
-    fn cmd_status(_req: &CommandRequest) -> CommandResponse {
+    fn cmd_status(req: &CommandRequest) -> CommandResponse {
+        pipeline::suppress_autonomous_reply_for_command(req);
         let rt = &*RUNTIME;
         let status = rt.block_on(async { pipeline::get_status().await });
         CommandResponse::text(&status)
