@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 9;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 10;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -125,6 +125,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         7 => migration_7_structured_memory(transaction)?,
         8 => migration_8_memory_retrieval(transaction)?,
         9 => migration_9_persona_and_knowledge_evidence(transaction)?,
+        10 => migration_10_delivery_idempotency(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -659,6 +660,36 @@ fn migration_9_persona_and_knowledge_evidence(conn: &Connection) -> Result<(), r
     Ok(())
 }
 
+fn migration_10_delivery_idempotency(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(
+        conn,
+        "messages",
+        "processing_status",
+        "TEXT NOT NULL DEFAULT 'legacy'",
+    )?;
+    ensure_column(conn, "messages", "processing_error", "TEXT")?;
+    ensure_column(conn, "messages", "processed_at", "INTEGER")?;
+    conn.execute_batch(
+        r#"
+        UPDATE messages
+        SET processing_status = 'legacy'
+        WHERE processing_status IS NULL OR processing_status = '';
+
+        UPDATE outbound_messages
+        SET action_key = action_key || ':legacy-duplicate:' || id
+        WHERE id NOT IN (
+            SELECT MIN(id) FROM outbound_messages GROUP BY action_key
+        );
+
+        CREATE INDEX idx_messages_processing_v10
+            ON messages(processing_status, created_at);
+        CREATE UNIQUE INDEX ux_outbound_action_key
+            ON outbound_messages(action_key);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -689,6 +720,9 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "bot_account_id",
                 "content",
                 "media_url",
+                "processing_status",
+                "processing_error",
+                "processed_at",
                 "updated_at",
             ][..],
         ),
@@ -834,7 +868,9 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
 
     let required_indexes = [
         "ux_msg_event_direction",
+        "idx_messages_processing_v10",
         "idx_outbound_status_time",
+        "ux_outbound_action_key",
         "idx_decision_outcome_time",
         "idx_llm_calls_status_time",
         "idx_compaction_status_time",
@@ -1269,6 +1305,65 @@ mod tests {
         assert_eq!(read_schema_version(&backup).unwrap(), 8);
         assert!(!object_exists(&backup, "table", "persona_nicknames").unwrap());
         assert!(!object_exists(&backup, "table", "knowledge_sources").unwrap());
+    }
+
+    #[test]
+    fn version_nine_database_gains_processing_state_and_unique_action_keys() {
+        let temporary = TempDatabase::new("version-nine");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 9).unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (event_key, protocol, direction, session_type, session_id,
+                  sender_id, content, created_at, updated_at)
+                 VALUES ('legacy-event', 'onebot11', 'inbound', 'group',
+                         'group-1', 'user-1', 'legacy', 10, 10)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO outbound_messages
+                 (action_key, protocol, session_type, session_id, content,
+                  status, attempt_count, created_at, updated_at)
+                 VALUES ('duplicate-action', 'onebot11', 'group', 'group-1',
+                         'first', 'accepted', 1, 10, 10),
+                        ('duplicate-action', 'onebot11', 'group', 'group-1',
+                         'second', 'rejected', 1, 11, 11);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version nine should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(column_exists(&connection, "messages", "processing_status").unwrap());
+        assert!(object_exists(&connection, "index", "ux_outbound_action_key").unwrap());
+        let processing_status: String = connection
+            .query_row(
+                "SELECT processing_status FROM messages WHERE event_key = 'legacy-event'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(processing_status, "legacy");
+        let distinct_actions: i64 = connection
+            .query_row(
+                "SELECT COUNT(DISTINCT action_key) FROM outbound_messages",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct_actions, 2);
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 9);
+        assert!(!column_exists(&backup, "messages", "processing_status").unwrap());
+        assert!(!object_exists(&backup, "index", "ux_outbound_action_key").unwrap());
     }
 
     #[test]

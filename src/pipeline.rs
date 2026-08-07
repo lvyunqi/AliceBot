@@ -125,30 +125,54 @@ pub fn db() -> Arc<Database> {
     try_db().expect("数据库尚未初始化")
 }
 
-/// 处理收到的一条消息（在 runtime 中异步执行）。
-pub async fn handle_message(event: NoticeEvent) {
+/// 在同步 FFI 回调内完成轻量规范化和单行 journal，成功后才进入有界处理队列。
+pub fn record_inbound(event: NoticeEvent) -> Result<Option<InMessage>, String> {
     let msg = normalize_message(&event);
-    let database = match try_db() {
-        Some(database) => database,
-        None => {
-            log::error!("[AliceBot] 收到消息但数据库尚未初始化");
-            return;
-        }
-    };
+    let database = try_db().ok_or_else(|| "database is not initialized".to_string())?;
 
-    // 消息 journal 必须早于画像、决策和 LLM。
-    match database.insert_message(&msg) {
-        Ok(true) => {}
-        Ok(false) => {
+    match database
+        .insert_message(&msg)
+        .map_err(|error| error.to_string())?
+    {
+        true => Ok(Some(msg)),
+        false => {
             log::trace!("[AliceBot] 忽略重复事件，event_key={}", msg.event_key);
-            return;
-        }
-        Err(e) => {
-            log::error!("[AliceBot] 消息入库失败: {e}");
-            return;
+            Ok(None)
         }
     }
+}
 
+/// 处理已写入 journal 的消息；即使决策选择静默，也会完成处理状态记录。
+pub async fn process_recorded_message(msg: InMessage) {
+    let Some(database) = try_db() else {
+        return;
+    };
+    let started_at = chrono::Utc::now().timestamp_millis();
+    let _ = database.set_message_processing_status(&msg.event_key, "processing", None, started_at);
+    process_recorded_message_inner(msg.clone()).await;
+    let _ = database.set_message_processing_status(
+        &msg.event_key,
+        "processed",
+        None,
+        chrono::Utc::now().timestamp_millis(),
+    );
+}
+
+pub fn mark_record_only(event_key: &str, reason: &str) {
+    let Some(database) = try_db() else {
+        return;
+    };
+    if let Err(error) = database.set_message_processing_status(
+        event_key,
+        "record_only",
+        Some(reason),
+        chrono::Utc::now().timestamp_millis(),
+    ) {
+        log::warn!("[AliceBot] record_only 状态写入失败: {error}");
+    }
+}
+
+async fn process_recorded_message_inner(msg: InMessage) {
     decision::observe_message(&msg);
     memory::observe_user(&msg).await;
     memory::push_short_context(&msg).await;
@@ -682,6 +706,7 @@ fn persona_prompt(config: &AppConfig) -> String {
 pub async fn get_status() -> String {
     struct StatusMetrics {
         message_count: i64,
+        record_only_messages: i64,
         llm_success: i64,
         llm_errors: i64,
         outbound_accepted: i64,
@@ -720,6 +745,9 @@ pub async fn get_status() -> String {
             .unwrap_or(-1.0);
         Some(StatusMetrics {
             message_count: count("SELECT COUNT(*) FROM messages"),
+            record_only_messages: count(
+                "SELECT COUNT(*) FROM messages WHERE processing_status = 'record_only'",
+            ),
             llm_success: count("SELECT COUNT(*) FROM llm_calls WHERE status = 'success'"),
             llm_errors: count("SELECT COUNT(*) FROM llm_calls WHERE status = 'error'"),
             outbound_accepted: count(
@@ -750,6 +778,7 @@ pub async fn get_status() -> String {
     });
     let metrics = metrics.unwrap_or(StatusMetrics {
         message_count: -1,
+        record_only_messages: -1,
         llm_success: -1,
         llm_errors: -1,
         outbound_accepted: -1,
@@ -775,6 +804,7 @@ pub async fn get_status() -> String {
     json!({
         "status": "running",
         "message_count": metrics.message_count,
+        "record_only_messages": metrics.record_only_messages,
         "llm_success": metrics.llm_success,
         "llm_errors": metrics.llm_errors,
         "outbound_accepted": metrics.outbound_accepted,

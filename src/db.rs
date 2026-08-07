@@ -6,7 +6,7 @@
 mod migrations;
 
 use migrations::DatabaseError;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -28,6 +28,13 @@ pub struct OutboundAttempt {
     pub content: String,
     pub media_type: Option<String>,
     pub media_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboundClaim {
+    Claimed(i64),
+    AlreadyAccepted,
+    InFlightOrUncertain,
 }
 
 pub struct DecisionTrace<'a> {
@@ -55,6 +62,17 @@ impl Database {
         let had_existing_database = migrations::has_existing_database(path);
         let mut conn = Connection::open(path)?;
         let report = migrations::prepare_database(path, &mut conn, had_existing_database)?;
+        let recovered = conn.execute(
+            "UPDATE messages
+             SET processing_status = 'record_only',
+                 processing_error = 'interrupted_by_restart'
+             WHERE direction = 'inbound'
+               AND processing_status IN ('recorded', 'queued', 'processing')",
+            [],
+        )?;
+        if recovered > 0 {
+            log::warn!("[AliceBot] marked {recovered} interrupted inbound messages as record_only");
+        }
         let memory_search = match crate::memory::search::initialize(&mut conn) {
             Ok(backend) => backend,
             Err(error) => {
@@ -98,8 +116,8 @@ impl Database {
             "INSERT OR IGNORE INTO messages
              (event_key, protocol, bot_account_id, direction, session_type, session_id, sender_id,
               sender_name, message_id, content, raw_json, has_media, media_type,
-              media_url, reply_to_id, at_me, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+              media_url, reply_to_id, at_me, processing_status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'recorded', ?16, ?16)",
             params![
                 msg.event_key,
                 msg.protocol,
@@ -122,14 +140,75 @@ impl Database {
         Ok(changed > 0)
     }
 
-    /// 记录一次发送前的 pending 尝试，并返回审计行 ID。
-    pub fn begin_outbound_attempt(
+    pub fn set_message_processing_status(
+        &self,
+        event_key: &str,
+        status: &str,
+        error: Option<&str>,
+        now: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages
+             SET processing_status = ?1, processing_error = ?2,
+                 processed_at = CASE WHEN ?1 = 'processed' THEN ?3 ELSE processed_at END,
+                 updated_at = MAX(COALESCE(updated_at, ?3), ?3)
+             WHERE event_key = ?4 AND direction = 'inbound'",
+            params![status, error.map(truncate_for_storage), now, event_key],
+        )?;
+        Ok(())
+    }
+
+    /// 原子认领一个动作。accepted/pending 动作不会再次提交给宿主。
+    pub fn claim_outbound_attempt(
         &self,
         attempt: &OutboundAttempt,
         now: i64,
-    ) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+    ) -> Result<OutboundClaim, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT id, status FROM outbound_messages WHERE action_key = ?1",
+                params![attempt.action_key],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((id, status)) = existing {
+            if status == "accepted" {
+                transaction.commit()?;
+                return Ok(OutboundClaim::AlreadyAccepted);
+            }
+            if status == "pending" || !matches!(status.as_str(), "rejected" | "invalid") {
+                transaction.commit()?;
+                return Ok(OutboundClaim::InFlightOrUncertain);
+            }
+            transaction.execute(
+                "UPDATE outbound_messages
+                 SET source_event_key = ?1, protocol = ?2, bot_account_id = ?3,
+                     session_type = ?4, session_id = ?5, content = ?6,
+                     media_type = ?7, media_url = ?8, status = 'pending',
+                     host_status = NULL, error = NULL,
+                     attempt_count = attempt_count + 1, updated_at = ?9
+                 WHERE id = ?10",
+                params![
+                    attempt.source_event_key,
+                    attempt.protocol,
+                    attempt.bot_account_id,
+                    attempt.session_type,
+                    attempt.session_id,
+                    truncate_for_storage(&attempt.content),
+                    attempt.media_type,
+                    attempt.media_url.as_deref().map(redact_url_for_storage),
+                    now,
+                    id,
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(OutboundClaim::Claimed(id));
+        }
+
+        transaction.execute(
             "INSERT INTO outbound_messages
              (action_key, source_event_key, protocol, bot_account_id, session_type, session_id,
               content, media_type, media_url, status, attempt_count, created_at, updated_at)
@@ -147,7 +226,9 @@ impl Database {
                 now,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(OutboundClaim::Claimed(id))
     }
 
     /// 更新宿主接收结果；`host_status` 使用 Debug 名称，便于跨版本诊断。
@@ -163,7 +244,7 @@ impl Database {
         conn.execute(
             "UPDATE outbound_messages
              SET status = ?1, host_status = ?2, error = ?3, updated_at = ?4
-             WHERE id = ?5",
+             WHERE id = ?5 AND status = 'pending'",
             params![
                 status,
                 host_status,
@@ -411,6 +492,25 @@ mod tests {
             .expect("count should work");
         assert_eq!(count, 1);
 
+        database
+            .set_message_processing_status(&message.event_key, "record_only", Some("queue_full"), 2)
+            .expect("record-only status should update");
+        let processing: (String, String) = database
+            .conn
+            .lock()
+            .expect("database lock should work")
+            .query_row(
+                "SELECT processing_status, processing_error FROM messages
+                 WHERE event_key = ?1",
+                params![message.event_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("processing status should be queryable");
+        assert_eq!(
+            processing,
+            ("record_only".to_string(), "queue_full".to_string())
+        );
+
         drop(database);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
@@ -426,8 +526,8 @@ mod tests {
         ));
         let database = Database::open(path.to_str().expect("temporary path is not UTF-8"))
             .expect("database should open");
-        let id = database
-            .begin_outbound_attempt(
+        let id = match database
+            .claim_outbound_attempt(
                 &OutboundAttempt {
                     action_key: "reply:test-event".to_string(),
                     source_event_key: Some("qq-official:test-event".to_string()),
@@ -441,7 +541,11 @@ mod tests {
                 },
                 10,
             )
-            .expect("outbound attempt should insert");
+            .expect("outbound attempt should insert")
+        {
+            OutboundClaim::Claimed(id) => id,
+            other => panic!("unexpected claim result: {other:?}"),
+        };
         database
             .finish_outbound_attempt(id, "accepted", Some("Accepted"), None, 11)
             .expect("outbound attempt should finish");
@@ -463,6 +567,69 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn action_claim_is_at_most_once_and_retries_only_definite_rejections() {
+        let database = Database::open(":memory:").unwrap();
+        let attempt = OutboundAttempt {
+            action_key: "reply:event-1:text".to_string(),
+            source_event_key: Some("event-1".to_string()),
+            protocol: "onebot11".to_string(),
+            bot_account_id: "bot-1".to_string(),
+            session_type: "group".to_string(),
+            session_id: "group-1".to_string(),
+            content: "hello".to_string(),
+            media_type: None,
+            media_url: None,
+        };
+
+        let id = match database.claim_outbound_attempt(&attempt, 10).unwrap() {
+            OutboundClaim::Claimed(id) => id,
+            other => panic!("unexpected first claim: {other:?}"),
+        };
+        assert_eq!(
+            database.claim_outbound_attempt(&attempt, 11).unwrap(),
+            OutboundClaim::InFlightOrUncertain
+        );
+        database
+            .finish_outbound_attempt(id, "accepted", Some("Accepted"), None, 12)
+            .unwrap();
+        assert_eq!(
+            database.claim_outbound_attempt(&attempt, 13).unwrap(),
+            OutboundClaim::AlreadyAccepted
+        );
+
+        let mut retry = attempt.clone();
+        retry.action_key = "reply:event-2:text".to_string();
+        let retry_id = match database.claim_outbound_attempt(&retry, 20).unwrap() {
+            OutboundClaim::Claimed(id) => id,
+            other => panic!("unexpected retry claim: {other:?}"),
+        };
+        database
+            .finish_outbound_attempt(
+                retry_id,
+                "rejected",
+                Some("QueueFull"),
+                Some("host rejected enqueue"),
+                21,
+            )
+            .unwrap();
+        assert_eq!(
+            database.claim_outbound_attempt(&retry, 22).unwrap(),
+            OutboundClaim::Claimed(retry_id)
+        );
+        let attempt_count: i64 = database
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT attempt_count FROM outbound_messages WHERE id = ?1",
+                params![retry_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_count, 2);
     }
 
     #[test]

@@ -7,16 +7,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::runtime::{Handle, Runtime};
-use tokio::sync::Notify;
-use tokio::task::JoinHandle;
+use tokio::sync::{Notify, Semaphore, mpsc};
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::AppConfig;
+use crate::pipeline::InMessage;
+
+const MESSAGE_QUEUE_CAPACITY: usize = 1024;
+const MESSAGE_CONCURRENCY: usize = 32;
 
 struct RuntimeState {
     runtime: Option<Runtime>,
     shutdown: Arc<AtomicBool>,
     stop_notify: Arc<Notify>,
     background_tasks: Vec<JoinHandle<()>>,
+    message_sender: Option<mpsc::Sender<InMessage>>,
 }
 
 /// 可重复启动和关闭的插件 runtime。
@@ -32,6 +37,7 @@ impl PluginRuntime {
                 shutdown: Arc::new(AtomicBool::new(false)),
                 stop_notify: Arc::new(Notify::new()),
                 background_tasks: Vec::new(),
+                message_sender: None,
             }),
         }
     }
@@ -44,11 +50,18 @@ impl PluginRuntime {
             .map_err(|_| "runtime 状态锁已损坏".to_string())?;
 
         if state.runtime.is_none() {
-            state.runtime =
-                Some(Runtime::new().map_err(|e| format!("创建 tokio runtime 失败: {e}"))?);
+            let runtime = Runtime::new().map_err(|e| format!("创建 tokio runtime 失败: {e}"))?;
             state.shutdown = Arc::new(AtomicBool::new(false));
             state.stop_notify = Arc::new(Notify::new());
-            state.background_tasks.clear();
+            let (sender, receiver) = mpsc::channel(MESSAGE_QUEUE_CAPACITY);
+            let worker = runtime.handle().spawn(message_dispatcher(
+                receiver,
+                state.shutdown.clone(),
+                state.stop_notify.clone(),
+            ));
+            state.runtime = Some(runtime);
+            state.background_tasks = vec![worker];
+            state.message_sender = Some(sender);
         } else {
             state.shutdown.store(false, Ordering::Release);
         }
@@ -74,19 +87,15 @@ impl PluginRuntime {
             .block_on(future)
     }
 
-    /// 投递一个已经拥有输入数据的异步任务。
-    pub fn spawn<F>(&self, future: F) -> bool
-    where
-        F: std::future::Future<Output = ()> + Send + 'static,
-    {
+    /// 将已拥有所有字段的入站消息送入有界处理队列。
+    pub fn submit_message(&self, message: InMessage) -> MessageSubmitResult {
         let Ok(state) = self.state.lock() else {
-            return false;
+            return MessageSubmitResult::Unavailable;
         };
-        let Some(runtime) = state.runtime.as_ref() else {
-            return false;
+        let Some(sender) = state.message_sender.as_ref() else {
+            return MessageSubmitResult::Unavailable;
         };
-        runtime.spawn(future);
-        true
+        try_submit_message(sender, message)
     }
 
     /// 启动后台任务（压缩、反思等）。
@@ -132,7 +141,7 @@ impl PluginRuntime {
 
     /// 停止后台任务并销毁 runtime，保证动态库卸载前不再执行插件代码。
     pub fn shutdown(&self) {
-        let (runtime, tasks, shutdown, stop_notify) = match self.state.lock() {
+        let (runtime, tasks, shutdown, stop_notify, message_sender) = match self.state.lock() {
             Ok(mut state) => {
                 state.shutdown.store(true, Ordering::Release);
                 (
@@ -140,11 +149,13 @@ impl PluginRuntime {
                     std::mem::take(&mut state.background_tasks),
                     state.shutdown.clone(),
                     state.stop_notify.clone(),
+                    state.message_sender.take(),
                 )
             }
             Err(_) => return,
         };
 
+        drop(message_sender);
         shutdown.store(true, Ordering::Release);
         stop_notify.notify_waiters();
         let Some(runtime) = runtime else {
@@ -157,6 +168,71 @@ impl PluginRuntime {
             }
         });
         runtime.shutdown_timeout(Duration::from_secs(5));
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageSubmitResult {
+    Enqueued,
+    Full,
+    Unavailable,
+}
+
+fn try_submit_message(sender: &mpsc::Sender<InMessage>, message: InMessage) -> MessageSubmitResult {
+    match sender.try_send(message) {
+        Ok(()) => MessageSubmitResult::Enqueued,
+        Err(mpsc::error::TrySendError::Full(_)) => MessageSubmitResult::Full,
+        Err(mpsc::error::TrySendError::Closed(_)) => MessageSubmitResult::Unavailable,
+    }
+}
+
+async fn message_dispatcher(
+    mut receiver: mpsc::Receiver<InMessage>,
+    shutdown: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
+) {
+    let permits = Arc::new(Semaphore::new(MESSAGE_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+
+    loop {
+        while tasks.try_join_next().is_some() {}
+        let permit = tokio::select! {
+            _ = stop_notify.notified() => break,
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let next_message = tokio::select! {
+            _ = stop_notify.notified() => break,
+            message = receiver.recv() => message,
+        };
+        let Some(message) = next_message else {
+            break;
+        };
+
+        let task_shutdown = shutdown.clone();
+        let task_notify = stop_notify.clone();
+        let event_key = message.event_key.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            if task_shutdown.load(Ordering::Acquire) {
+                crate::pipeline::mark_record_only(&event_key, "shutdown");
+                return;
+            }
+            tokio::select! {
+                _ = task_notify.notified() => {
+                    crate::pipeline::mark_record_only(&event_key, "shutdown");
+                }
+                _ = crate::pipeline::process_recorded_message(message) => {}
+            }
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            log::debug!("[AliceBot] message worker stopped: {error}");
+        }
     }
 }
 
@@ -175,5 +251,39 @@ mod tests {
         runtime.start().expect("runtime should restart");
         assert_eq!(runtime.block_on(async { 3 + 3 }), 6);
         runtime.shutdown();
+    }
+
+    #[test]
+    fn bounded_message_sender_reports_full_without_dropping_contract() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let message = test_message("queue-1");
+        assert_eq!(
+            try_submit_message(&sender, message.clone()),
+            MessageSubmitResult::Enqueued
+        );
+        assert_eq!(
+            try_submit_message(&sender, message),
+            MessageSubmitResult::Full
+        );
+    }
+
+    fn test_message(event_key: &str) -> InMessage {
+        InMessage {
+            event_key: event_key.to_string(),
+            protocol: "onebot11".to_string(),
+            bot_account_id: String::new(),
+            session_type: "group".to_string(),
+            session_id: "group-1".to_string(),
+            sender_id: "user-1".to_string(),
+            sender_name: "user".to_string(),
+            message_id: event_key.to_string(),
+            reply_to_id: String::new(),
+            content: "test".to_string(),
+            media: Vec::new(),
+            has_media: false,
+            at_me: false,
+            timestamp: 1,
+            safe_raw_json: "{}".to_string(),
+        }
     }
 }

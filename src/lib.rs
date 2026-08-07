@@ -122,8 +122,28 @@ mod plugin {
     fn on_message(req: &NoticeRequest) -> NoticeResponse {
         let rt = &*RUNTIME;
         let event = pipeline::NoticeEvent::from_request(req);
-        if !rt.spawn(async move { pipeline::handle_message(event).await }) {
-            log::warn!("[AliceBot] runtime 未运行，丢弃消息处理任务");
+        match pipeline::record_inbound(event) {
+            Ok(Some(message)) => match rt.submit_message(message.clone()) {
+                runtime::MessageSubmitResult::Enqueued => {}
+                runtime::MessageSubmitResult::Full => {
+                    pipeline::mark_record_only(&message.event_key, "queue_full");
+                    log::warn!(
+                        "[AliceBot] 入站处理队列已满，保留 record_only event_key={}",
+                        message.event_key
+                    );
+                }
+                runtime::MessageSubmitResult::Unavailable => {
+                    pipeline::mark_record_only(&message.event_key, "runtime_unavailable");
+                    log::warn!(
+                        "[AliceBot] runtime 不可用，保留 record_only event_key={}",
+                        message.event_key
+                    );
+                }
+            },
+            Ok(None) => {}
+            Err(error) => {
+                log::error!("[AliceBot] 入站消息 journal 失败: {error}");
+            }
         }
         NoticeResponse {
             action: abi_stable_host_api::DynamicActionResponse::ignore(),

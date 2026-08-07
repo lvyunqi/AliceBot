@@ -5,12 +5,11 @@
 use abi_stable_host_api::{BotApi, SendEnqueueStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::db::OutboundAttempt;
+use crate::db::{OutboundAttempt, OutboundClaim};
 
 static NEXT_ACTION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 保留旧的文本发送入口，适合没有入站事件关联的主动发送。
-#[allow(dead_code)]
 #[allow(dead_code)]
 pub async fn send_text(account_id: &str, session_id: &str, session_type: &str, text: &str) -> bool {
     send_text_for_event(account_id, "unknown", session_id, session_type, text, None).await
@@ -25,7 +24,7 @@ pub async fn send_text_for_event(
     text: &str,
     source_event_key: Option<&str>,
 ) -> bool {
-    let audit_id = begin_attempt(
+    let audit_id = match begin_attempt(
         "text",
         source_event_key,
         protocol,
@@ -35,7 +34,11 @@ pub async fn send_text_for_event(
         text,
         None,
         None,
-    );
+    ) {
+        Some(AttemptStart::Claimed(id)) => Some(id),
+        Some(AttemptStart::AlreadyHandled) => return false,
+        None => return false,
+    };
 
     if account_id.trim().is_empty() {
         finish_attempt(audit_id, "invalid", None, Some("missing account_id"));
@@ -123,7 +126,7 @@ pub async fn send_image_url_for_event(
     source_event_key: Option<&str>,
 ) -> bool {
     let content = caption.unwrap_or_default();
-    let audit_id = begin_attempt(
+    let audit_id = match begin_attempt(
         "image",
         source_event_key,
         protocol,
@@ -133,7 +136,11 @@ pub async fn send_image_url_for_event(
         content,
         Some("image"),
         Some(url),
-    );
+    ) {
+        Some(AttemptStart::Claimed(id)) => Some(id),
+        Some(AttemptStart::AlreadyHandled) => return false,
+        None => return false,
+    };
 
     if account_id.trim().is_empty() {
         finish_attempt(audit_id, "invalid", None, Some("missing account_id"));
@@ -197,6 +204,11 @@ pub async fn send_image_url_for_event(
     accepted
 }
 
+enum AttemptStart {
+    Claimed(i64),
+    AlreadyHandled,
+}
+
 fn begin_attempt(
     kind: &str,
     source_event_key: Option<&str>,
@@ -207,14 +219,17 @@ fn begin_attempt(
     content: &str,
     media_type: Option<&str>,
     media_url: Option<&str>,
-) -> Option<i64> {
+) -> Option<AttemptStart> {
     let database = crate::pipeline::try_db()?;
     let action_key = source_event_key
         .filter(|key| !key.trim().is_empty())
         .map(|key| format!("reply:{key}:{kind}"))
         .unwrap_or_else(|| {
             let sequence = NEXT_ACTION_ID.fetch_add(1, Ordering::Relaxed);
-            format!("proactive:{kind}:{sequence}")
+            format!(
+                "proactive:{kind}:{}:{sequence}",
+                chrono::Utc::now().timestamp_millis()
+            )
         });
     let attempt = OutboundAttempt {
         action_key,
@@ -229,8 +244,15 @@ fn begin_attempt(
         media_type: media_type.map(str::to_string),
         media_url: media_url.map(str::to_string),
     };
-    match database.begin_outbound_attempt(&attempt, chrono::Utc::now().timestamp_millis()) {
-        Ok(id) => Some(id),
+    match database.claim_outbound_attempt(&attempt, chrono::Utc::now().timestamp_millis()) {
+        Ok(OutboundClaim::Claimed(id)) => Some(AttemptStart::Claimed(id)),
+        Ok(OutboundClaim::AlreadyAccepted | OutboundClaim::InFlightOrUncertain) => {
+            log::debug!(
+                "[AliceBot] 跳过已认领或结果不确定的出站动作 action_key={}",
+                attempt.action_key
+            );
+            Some(AttemptStart::AlreadyHandled)
+        }
         Err(error) => {
             log::warn!("[AliceBot] 出站审计写入失败: {error}");
             None
