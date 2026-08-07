@@ -1,0 +1,197 @@
+[
+  {
+    "id": "required-mention-question",
+    "label": "required",
+    "content": "能帮我看看这个问题吗？",
+    "signals": {"mentioned": true, "is_question": true, "group_quiet": true}
+  },
+  {
+    "id": "required-direct-question",
+    "label": "required",
+    "content": "这个要怎么处理？",
+    "signals": {"is_question": true}
+  },
+  {
+    "id": "required-reply-chain",
+    "label": "required",
+    "content": "接着刚才说的呢？",
+    "signals": {"is_reply_to_me": true, "is_question": true}
+  },
+  {
+    "id": "required-help",
+    "label": "required",
+    "content": "有点急，谁能告诉我怎么办？",
+    "signals": {"is_question": true, "emotional": true}
+  },
+  {
+    "id": "required-media-question",
+    "label": "required",
+    "content": "这张图是什么意思？",
+    "signals": {"is_question": true, "has_media": true}
+  },
+  {
+    "id": "required-known-user",
+    "label": "required",
+    "content": "你还记得我们昨天聊的吗？",
+    "signals": {"is_question": true, "known_user": true, "intimacy": 55}
+  },
+  {
+    "id": "required-busy-mention",
+    "label": "required",
+    "content": "人很多，但我在问你这个？",
+    "signals": {"mentioned": true, "is_question": true, "recent_messages": 18, "activity_ewma": 0.95, "burst_penalty": 0.67}
+  },
+  {
+    "id": "required-quiet-question",
+    "label": "required",
+    "content": "现在有人知道答案吗？",
+    "signals": {"is_question": true, "group_quiet": true, "activity_ewma": 0.08}
+  },
+  {
+    "id": "required-clarification",
+    "label": "required",
+    "content": "你的意思是要重试一次吗？",
+    "signals": {"is_reply_to_me": true, "is_question": true, "known_user": true}
+  },
+  {
+    "id": "required-factual",
+    "label": "required",
+    "content": "会议是几点开始？",
+    "signals": {"is_question": true}
+  },
+
+  {
+    "id": "avoid-link-spam",
+    "label": "avoid",
+    "content": "看看这些链接",
+    "signals": {"is_spam": true}
+  },
+  {
+    "id": "avoid-repeated-spam",
+    "label": "avoid",
+    "content": "重复重复重复重复",
+    "signals": {"is_spam": true, "emotional": true}
+  },
+  {
+    "id": "avoid-sender-burst",
+    "label": "avoid",
+    "content": "连续第五条",
+    "signals": {"too_frequent": true, "sender_messages": 5, "activity_ewma": 0.92, "burst_penalty": 0.47}
+  },
+  {
+    "id": "avoid-cooldown",
+    "label": "avoid",
+    "content": "机器人刚说完后的普通消息",
+    "last_outbound_age_ms": 5000,
+    "signals": {"recent_reply_penalty": 0.67}
+  },
+  {
+    "id": "avoid-background-chatter",
+    "label": "avoid",
+    "content": "今天路上人挺多",
+    "signals": {}
+  },
+  {
+    "id": "avoid-laughter-only",
+    "label": "avoid",
+    "content": "笑死",
+    "signals": {"emotional": true}
+  },
+  {
+    "id": "avoid-unsolicited-media",
+    "label": "avoid",
+    "content": "",
+    "signals": {"has_media": true, "activity_ewma": 0.75}
+  },
+  {
+    "id": "avoid-familiar-aside",
+    "label": "avoid",
+    "content": "我先去吃饭了",
+    "signals": {"known_user": true, "intimacy": 30}
+  },
+  {
+    "id": "avoid-peak-chatter",
+    "label": "avoid",
+    "content": "群里正在刷屏时的一句闲聊",
+    "signals": {"recent_messages": 20, "activity_ewma": 0.98, "burst_penalty": 0.87}
+  },
+  {
+    "id": "avoid-topic-miss",
+    "label": "avoid",
+    "content": "和当前讨论完全无关的一句",
+    "signals": {"out_of_topic": true}
+  },
+  {
+    "id": "avoid-recent-density",
+    "label": "avoid",
+    "content": "机器人最近已经说了很多",
+    "signals": {"recent_reply_penalty": 0.6}
+  },
+  {
+    "id": "avoid-busy-emotion",
+    "label": "avoid",
+    "content": "哈哈群里好热闹",
+    "signals": {"emotional": true, "recent_messages": 16, "activity_ewma": 0.96, "burst_penalty": 0.73}
+  },
+
+  {
+    "id": "optional-quiet-greeting",
+    "label": "optional",
+    "content": "晚上好",
+    "signals": {"group_quiet": true, "activity_ewma": 0.05}
+  },
+  {
+    "id": "optional-topic-hit",
+    "label": "optional",
+    "content": "刚才那个话题挺有意思",
+    "signals": {"topic_hit": true}
+  },
+  {
+    "id": "optional-known-greeting",
+    "label": "optional",
+    "content": "我又来了",
+    "signals": {"known_user": true, "intimacy": 45}
+  },
+  {
+    "id": "optional-emotional",
+    "label": "optional",
+    "content": "今天终于搞定了！",
+    "signals": {"emotional": true}
+  },
+  {
+    "id": "optional-media",
+    "label": "optional",
+    "content": "分享一张图",
+    "signals": {"has_media": true}
+  },
+  {
+    "id": "optional-plain-one",
+    "label": "optional",
+    "content": "今天风有点大",
+    "signals": {}
+  },
+  {
+    "id": "optional-plain-two",
+    "label": "optional",
+    "content": "刚泡了一杯茶",
+    "signals": {}
+  },
+  {
+    "id": "optional-quiet-media",
+    "label": "optional",
+    "content": "这个还挺好看",
+    "signals": {"has_media": true, "group_quiet": true, "activity_ewma": 0.12}
+  },
+  {
+    "id": "optional-known-topic",
+    "label": "optional",
+    "content": "又聊到上次的主题了",
+    "signals": {"known_user": true, "topic_hit": true, "intimacy": 40}
+  },
+  {
+    "id": "optional-mildly-busy",
+    "label": "optional",
+    "content": "大家聊得挺快",
+    "signals": {"recent_messages": 9, "activity_ewma": 0.7}
+  }
+]

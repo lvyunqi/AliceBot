@@ -1,18 +1,22 @@
 //! Deterministic reply decision engine with persisted traces.
 mod coalesce;
+#[cfg(test)]
+mod replay;
 mod session;
 
 use crate::pipeline::InMessage;
+use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
 pub(crate) use coalesce::CoalescedMessage;
 
-const POLICY_VERSION: &str = "reply-v2-ewma";
+const POLICY_VERSION: &str = "reply-v3-gated";
 const MIN_AUTONOMOUS_SCORE: f32 = 32.0;
 const DIRECT_SCORE_THRESHOLD: f32 = 35.0;
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default)]
 pub struct ReplySignals {
     pub mentioned: bool,
     pub is_question: bool,
@@ -98,6 +102,15 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
     }
 
     let signals = collect_signals(msg, &snapshot, &config);
+    evaluate_with_signals(msg, &config, &snapshot, signals)
+}
+
+fn evaluate_with_signals(
+    msg: &InMessage,
+    config: &crate::config::AppConfig,
+    snapshot: &session::SessionSnapshot,
+    signals: ReplySignals,
+) -> ReplyDecision {
     let direct = signals.mentioned || signals.is_question || signals.is_reply_to_me;
     let threshold = if direct {
         DIRECT_SCORE_THRESHOLD
@@ -112,7 +125,10 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
     } else {
         0.5
     };
-    let p_final = (0.75 * p_rule + 0.25 * participation_prior).clamp(0.0, 1.0);
+    let prior_blend = (0.75 * p_rule + 0.25 * participation_prior).clamp(0.0, 1.0);
+    let burst_gate = (1.0 - signals.burst_penalty.clamp(0.0, 1.0)).powi(2);
+    let recent_reply_gate = (1.0 - signals.recent_reply_penalty.clamp(0.0, 1.0)).powi(2);
+    let p_final = (prior_blend * burst_gate * recent_reply_gate).clamp(0.0, 1.0);
     let random_value = deterministic_random(&msg.event_key, POLICY_VERSION);
     let (should_reply, reason) = if signals.is_spam {
         (false, "spam_detected")
@@ -120,7 +136,7 @@ pub fn evaluate(msg: &InMessage) -> ReplyDecision {
         (false, "sender_burst")
     } else if !msg.at_me
         && !signals.is_reply_to_me
-        && is_in_cooldown(&snapshot, msg.timestamp, config.min_interval_sec())
+        && is_in_cooldown(snapshot, msg.timestamp, config.min_interval_sec())
     {
         (false, "session_cooldown")
     } else if !config.decision.enabled && !direct {
