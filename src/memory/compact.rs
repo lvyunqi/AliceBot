@@ -270,6 +270,8 @@ struct SessionBatch {
 mod tests {
     use super::*;
 
+    static TEST_PIPELINE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn compaction_config_has_a_nonzero_default() {
         let config = AppConfig::default();
@@ -279,6 +281,7 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_writes_summary_and_advances_cursor() {
+        let _guard = TEST_PIPELINE_LOCK.lock().await;
         let path = std::env::temp_dir().join(format!(
             "alicebot-compaction-test-{}-{}.db",
             std::process::id(),
@@ -374,6 +377,85 @@ mod tests {
             database.get_meta("compaction_cursor").unwrap().as_deref(),
             Some("2")
         );
+        crate::pipeline::clear_db();
+        drop(database);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn compaction_failure_keeps_cursor_at_the_previous_boundary() {
+        let _guard = TEST_PIPELINE_LOCK.lock().await;
+        let path = std::env::temp_dir().join(format!(
+            "alicebot-compaction-failure-test-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let database = crate::db::Database::open(path.to_str().expect("path should be UTF-8"))
+            .expect("database should open");
+        database
+            .insert_message(&crate::pipeline::InMessage {
+                event_key: "compact:failure-event".to_string(),
+                protocol: "onebot11".to_string(),
+                bot_account_id: String::new(),
+                session_type: "group".to_string(),
+                session_id: "group-compact-failure".to_string(),
+                sender_id: "user-1".to_string(),
+                sender_name: "user".to_string(),
+                message_id: "message-failure".to_string(),
+                reply_to_id: String::new(),
+                content: "this batch must fail".to_string(),
+                media: Vec::new(),
+                has_media: false,
+                at_me: false,
+                timestamp: 1_000,
+                safe_raw_json: "{}".to_string(),
+            })
+            .expect("message should insert");
+        database
+            .conn
+            .lock()
+            .expect("database lock should work")
+            .execute_batch(
+                "CREATE TRIGGER force_compaction_failure
+                 BEFORE INSERT ON long_memory
+                 WHEN NEW.kind = 'conversation_summary'
+                 BEGIN
+                    SELECT RAISE(ABORT, 'forced compaction failure');
+                 END;",
+            )
+            .expect("failure trigger should install");
+        crate::pipeline::set_db(database);
+
+        let mut config = AppConfig::default();
+        config.memories.compress_min_messages = 1;
+        let error = run_if_due(&config)
+            .await
+            .expect_err("trigger should abort compaction");
+        assert!(error.contains("forced compaction failure"));
+
+        let database = crate::pipeline::try_db().expect("database should remain installed");
+        assert_eq!(database.get_meta("compaction_cursor").unwrap(), None);
+        let connection = database.conn.lock().expect("database lock should work");
+        let run: (String, i64, i64) = connection
+            .query_row(
+                "SELECT status, cursor_start, cursor_end
+                 FROM compaction_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("failed run should be recorded");
+        assert_eq!(run, ("failed".to_string(), 0, 1));
+        let summaries: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM long_memory WHERE kind = 'conversation_summary'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("summary count should work");
+        assert_eq!(summaries, 0);
+        drop(connection);
         crate::pipeline::clear_db();
         drop(database);
         let _ = std::fs::remove_file(&path);

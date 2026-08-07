@@ -81,6 +81,17 @@ mod plugin {
             }
         }
 
+        match memory::restore_short_context() {
+            Ok(report) => log::info!(
+                "[AliceBot] 短期上下文恢复完成: sessions={}, messages={}, inbound={}, outbound={}",
+                report.sessions,
+                report.messages,
+                report.inbound_messages,
+                report.outbound_messages
+            ),
+            Err(error) => log::warn!("[AliceBot] 短期上下文恢复失败，使用空缓存继续启动: {error}"),
+        }
+
         // 启动后台任务（压缩、反思等）
         if let Err(e) = rt.start_background_tasks(cfg) {
             pipeline::clear_db();

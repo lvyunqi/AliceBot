@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 11;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 12;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -127,6 +127,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         9 => migration_9_persona_and_knowledge_evidence(transaction)?,
         10 => migration_10_delivery_idempotency(transaction)?,
         11 => migration_11_memory_route_isolation(transaction)?,
+        12 => migration_12_short_context_recovery_indexes(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -796,6 +797,36 @@ fn migration_11_memory_route_isolation(conn: &Connection) -> Result<(), rusqlite
     Ok(())
 }
 
+fn migration_12_short_context_recovery_indexes(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_messages_recovery_recent_v12
+            ON messages(direction, created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_messages_recovery_route_v12
+            ON messages(
+                protocol,
+                session_type,
+                session_id,
+                direction,
+                created_at DESC,
+                id DESC
+            );
+        CREATE INDEX IF NOT EXISTS idx_outbound_recovery_recent_v12
+            ON outbound_messages(status, updated_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_outbound_recovery_route_v12
+            ON outbound_messages(
+                protocol,
+                session_type,
+                session_id,
+                status,
+                updated_at DESC,
+                id DESC
+            );
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(
     conn: &Connection,
     table: &str,
@@ -987,6 +1018,10 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_memory_sources_source",
         "idx_memory_retrieve_v8",
         "idx_memory_retrieve_v11",
+        "idx_messages_recovery_recent_v12",
+        "idx_messages_recovery_route_v12",
+        "idx_outbound_recovery_recent_v12",
+        "idx_outbound_recovery_route_v12",
         "ux_knowledge_key_version",
         "idx_persona_subject_protocol",
         "idx_persona_observation_subject",
@@ -1558,6 +1593,33 @@ mod tests {
         assert!(!column_exists(&backup, "long_memory", "protocol").unwrap());
         assert!(!object_exists(&backup, "index", "idx_memory_retrieve_v11").unwrap());
         assert!(object_exists(&backup, "index", "ux_memory_key_version").unwrap());
+    }
+
+    #[test]
+    fn version_eleven_database_gains_short_context_recovery_indexes() {
+        let temporary = TempDatabase::new("version-eleven");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 11).unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version eleven should migrate");
+        let connection = database.conn.lock().unwrap();
+        for index in [
+            "idx_messages_recovery_recent_v12",
+            "idx_messages_recovery_route_v12",
+            "idx_outbound_recovery_recent_v12",
+            "idx_outbound_recovery_route_v12",
+        ] {
+            assert!(object_exists(&connection, "index", index).unwrap());
+        }
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 11);
+        assert!(!object_exists(&backup, "index", "idx_messages_recovery_recent_v12").unwrap());
     }
 
     #[test]

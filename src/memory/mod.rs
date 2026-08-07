@@ -39,6 +39,17 @@ pub fn short_context(
     short::get_context(protocol, session_type, session_id, max_tokens)
 }
 
+/// Restore the bounded short-context cache after a process restart or plugin reload.
+pub(crate) fn restore_short_context() -> Result<short::RestoreReport, String> {
+    let database =
+        crate::pipeline::try_db().ok_or_else(|| "database is not initialized".to_string())?;
+    short::restore_from_database(
+        &database,
+        crate::pipeline::current_config().memories.short_size,
+        chrono::Utc::now().timestamp_millis(),
+    )
+}
+
 /// 推入已经成功发送的机器人回复。
 pub async fn push_assistant_context(
     protocol: &str,
