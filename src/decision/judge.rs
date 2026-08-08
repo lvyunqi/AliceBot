@@ -112,6 +112,7 @@ fn reply_judge_request(msg: &InMessage) -> ChatRequest {
         ))],
         temperature: 0.0,
         max_tokens: 96,
+        tools: Vec::new(),
     }
 }
 

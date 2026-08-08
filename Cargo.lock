@@ -61,11 +61,12 @@ dependencies = [
 
 [[package]]
 name = "alicebot"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "abi-stable-host-api",
  "abi_stable",
  "async-trait",
+ "base64",
  "chrono",
  "dotenvy",
  "log",

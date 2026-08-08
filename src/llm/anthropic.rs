@@ -32,14 +32,9 @@ impl Llm for AnthropicClient {
         for message in &req.messages {
             match message.role {
                 Role::System => {}
-                Role::User => messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": content_value(message),
-                })),
-                Role::Assistant => messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": content_value(message),
-                })),
+                Role::User => messages.push(message_value(message, "user")),
+                Role::Assistant => messages.push(message_value(message, "assistant")),
+                Role::Tool => messages.push(message_value(message, "user")),
             }
         }
 
@@ -61,6 +56,20 @@ impl Llm for AnthropicClient {
             "messages": messages,
             "temperature": req.temperature,
         });
+        if !req.tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(
+                req.tools
+                    .iter()
+                    .map(|tool| {
+                        serde_json::json!({
+                            "name": tool.name,
+                            "description": tool.description,
+                            "input_schema": tool.parameters,
+                        })
+                    })
+                    .collect(),
+            );
+        }
         let system_text = req
             .system
             .as_deref()
@@ -97,25 +106,60 @@ impl Llm for AnthropicClient {
             .json()
             .await
             .map_err(|_| response_parse_error("Anthropic"))?;
-        let text = data["content"]
-            .as_array()
-            .and_then(|items| items.first())
-            .and_then(|item| item["text"].as_str())
-            .ok_or_else(|| LlmError {
+        let mut text_parts = Vec::new();
+        let mut tool_calls = Vec::new();
+        if let Some(items) = data["content"].as_array() {
+            for item in items {
+                match item["type"].as_str() {
+                    Some("text") => {
+                        if let Some(text) = item["text"].as_str() {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    Some("tool_use") => {
+                        let Some(name) = item["name"].as_str().map(str::trim) else {
+                            continue;
+                        };
+                        if name.is_empty() {
+                            continue;
+                        }
+                        let arguments = item
+                            .get("input")
+                            .and_then(|input| serde_json::to_string(input).ok())
+                            .unwrap_or_else(|| "{}".to_string());
+                        tool_calls.push(ToolCall {
+                            id: item["id"]
+                                .as_str()
+                                .filter(|value| !value.trim().is_empty())
+                                .unwrap_or("call-unknown")
+                                .chars()
+                                .take(128)
+                                .collect(),
+                            name: name.chars().take(80).collect(),
+                            arguments: arguments.chars().take(16_384).collect(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let text = text_parts.join("\n");
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            return Err(LlmError {
                 kind: ErrorKind::Parse,
                 message: "unable to parse Anthropic response".to_string(),
-            })?
-            .to_string();
-        Ok(ChatResponse { text })
+            });
+        }
+        Ok(ChatResponse { text, tool_calls })
     }
 }
 
 fn content_value(message: &ChatMessage) -> serde_json::Value {
-    if message.image_urls.is_empty() {
+    if message.image_urls.is_empty() && message.image_data.is_empty() {
         return serde_json::json!(message.content);
     }
 
-    let mut blocks = Vec::with_capacity(message.image_urls.len() + 1);
+    let mut blocks = Vec::with_capacity(message.image_urls.len() + message.image_data.len() + 1);
     if !message.content.trim().is_empty() {
         blocks.push(serde_json::json!({
             "type": "text",
@@ -128,7 +172,51 @@ fn content_value(message: &ChatMessage) -> serde_json::Value {
             "source": {"type": "url", "url": url},
         })
     }));
+    blocks.extend(message.image_data.iter().map(|image| {
+        serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": image.base64,
+            },
+        })
+    }));
     serde_json::Value::Array(blocks)
+}
+
+fn message_value(message: &ChatMessage, role: &str) -> serde_json::Value {
+    if message.role == Role::Tool {
+        return serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": message.tool_call_id.as_deref().unwrap_or_default(),
+                "content": message.content,
+            }],
+        });
+    }
+    if !message.tool_calls.is_empty() {
+        let mut blocks = Vec::new();
+        if !message.content.trim().is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": message.content}));
+        }
+        blocks.extend(message.tool_calls.iter().map(|call| {
+            let input = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::json!({
+                "type": "tool_use",
+                "id": call.id,
+                "name": call.name,
+                "input": input,
+            })
+        }));
+        return serde_json::json!({"role": role, "content": blocks});
+    }
+    serde_json::json!({
+        "role": role,
+        "content": content_value(message),
+    })
 }
 
 fn status_error_kind(status: u16) -> ErrorKind {
@@ -159,6 +247,7 @@ mod tests {
             messages: vec![ChatMessage::user("hello"), ChatMessage::assistant("hi")],
             temperature: 0.6,
             max_tokens: 64,
+            tools: Vec::new(),
         };
 
         let response = client
@@ -193,6 +282,7 @@ mod tests {
             messages: vec![ChatMessage::assistant("orphan")],
             temperature: 1.0,
             max_tokens: 32,
+            tools: Vec::new(),
         };
 
         let error = client
@@ -216,6 +306,7 @@ mod tests {
             ],
             temperature: 0.2,
             max_tokens: 32,
+            tools: Vec::new(),
         };
 
         client
@@ -233,6 +324,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serializes_tools_and_parses_tool_use_blocks() {
+        let (base_url, server) = spawn_json_server(
+            200,
+            r#"{"content":[{"type":"tool_use","id":"tool-1","name":"search_memory","input":{"query":"咖啡"}}]}"#,
+        );
+        let client = AnthropicClient::new(&base_url, "test-key", Duration::from_secs(5));
+        let request = ChatRequest {
+            model: "claude-mock".to_string(),
+            system: None,
+            messages: vec![ChatMessage::user("你记得我的偏好吗？")],
+            temperature: 0.0,
+            max_tokens: 64,
+            tools: vec![ChatTool {
+                name: "search_memory".to_string(),
+                description: "read-only".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        };
+
+        let response = client
+            .chat(&request)
+            .await
+            .expect("tool response should parse");
+        let raw_request = server.join().expect("mock server should finish");
+        let (_, body) = raw_request
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request should be JSON");
+        assert_eq!(body["tools"][0]["name"], "search_memory");
+        assert_eq!(response.tool_calls[0].id, "tool-1");
+        assert_eq!(response.tool_calls[0].name, "search_memory");
+        assert_eq!(response.tool_calls[0].arguments, r#"{"query":"咖啡"}"#);
+    }
+
+    #[tokio::test]
     async fn http_error_does_not_expose_body_prompt_or_api_key() {
         let (base_url, server) = spawn_json_server(
             500,
@@ -245,6 +371,7 @@ mod tests {
             messages: vec![ChatMessage::user("hello")],
             temperature: 0.6,
             max_tokens: 64,
+            tools: Vec::new(),
         };
 
         let error = client
