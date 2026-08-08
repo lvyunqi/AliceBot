@@ -91,9 +91,9 @@ jobs:
           asset="release-assets/lib${ASSET_LIB_STEM}-${TARGET}.so"
           test -f "$source"
           cp "$source" "$asset"
-          sha256sum "$asset" > "${asset}.sha256"
           size_bytes="$(stat --format=%s "$asset")"
           sha256="$(sha256sum "$asset" | awk '{print $1}')"
+          printf '%s  %s\n' "$sha256" "$(basename "$asset")" > "${asset}.sha256"
           generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
           printf '{\n  "plugin_id": "%s",\n  "target": "%s",\n  "asset_name": "%s",\n  "size_bytes": %s,\n  "sha256": "%s",\n  "generated_at_utc": "%s"\n}\n' \
             "$PLUGIN_ID" "$TARGET" "$(basename "$asset")" "$size_bytes" "$sha256" "$generated_at" > "${asset}.manifest.json"
