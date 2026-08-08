@@ -1089,6 +1089,16 @@ async fn generate_reply(
         &msg.session_id,
         state.config.behavior.max_context_tokens,
     );
+    // Media lookup is deliberately independent from the prompt token budget:
+    // a long caption should not make a recent image impossible to reference.
+    let media_history =
+        memory::short_context(&msg.protocol, &msg.session_type, &msg.session_id, u32::MAX);
+    let referenced_history_image = referenced_history_image(msg, &media_history);
+    let prompt_content = if referenced_history_image.is_some() {
+        format!("{content}{HISTORICAL_IMAGE_CONTEXT_MARKER}")
+    } else {
+        content.clone()
+    };
     let mut base_system = persona_prompt(&state.config);
     base_system.push_str(
         "\n身份规则：当前消息的实际发言者只由用户消息中的 [说话者: ...] 标签和宿主 author 元数据确定。\
@@ -1106,7 +1116,7 @@ async fn generate_reply(
         long_memories: &long_memories,
         history: &history,
         current: msg,
-        current_content: &content,
+        current_content: &prompt_content,
         source_event_keys,
         configured_budget: state.config.behavior.max_context_tokens,
     });
@@ -1124,7 +1134,10 @@ async fn generate_reply(
             .collect();
         current_message.vision_required = !current_message.image_urls.is_empty();
     }
-    attach_recent_referenced_image(&mut assembled.messages, msg, &history);
+    let historical_image_requested = referenced_history_image.is_some();
+    if let Some(referenced_image) = referenced_history_image {
+        attach_referenced_history_image(&mut assembled.messages, referenced_image);
+    }
     if let Some(current_message) = assembled
         .messages
         .iter_mut()
@@ -1133,6 +1146,7 @@ async fn generate_reply(
     {
         current_message.vision_required |= current_message.has_images();
     }
+    let visual_input_expected = historical_image_requested || msg.media.iter().any(is_image_media);
     let vision_image_count =
         prepare_vision_messages(&mut assembled.messages, state.config.llm.request_timeout_ms).await;
     if vision_image_count > 0 {
@@ -1140,6 +1154,13 @@ async fn generate_reply(
             "[AliceBot] vision inputs prepared: images={vision_image_count}, event_key={}",
             msg.event_key
         );
+    }
+    if visual_input_expected && vision_image_count == 0 {
+        return Ok(if historical_image_requested {
+            "我收到了你刚才发的图，但图片没加载出来，暂时看不清内容。".to_string()
+        } else {
+            "图我收到了，但图片没加载出来，暂时看不清内容。".to_string()
+        });
     }
     log::trace!(
         "[AliceBot] assembled prompt context: estimated_tokens={}, messages={}",
@@ -1173,9 +1194,13 @@ async fn generate_reply(
     } else {
         state.llm.chat_with_task("group_reply", &request).await
     };
-    response
-        .map(|response| response.text.trim().to_string())
-        .map_err(|error| format!("{:?}", error.kind))
+    match response {
+        Ok(response) => Ok(response.text.trim().to_string()),
+        Err(error) if visual_input_expected && matches!(error.kind, ErrorKind::NoProvider) => {
+            Ok("图我收到了，但当前没有可用的识图模型，暂时看不清内容。".to_string())
+        }
+        Err(error) => Err(format!("{:?}", error.kind)),
+    }
 }
 
 fn is_image_media(media: &MediaRef) -> bool {
@@ -1190,6 +1215,9 @@ fn is_image_media(media: &MediaRef) -> bool {
         || media.url.to_ascii_lowercase().contains(".webp")
         || media.url.to_ascii_lowercase().contains(".gif")
 }
+
+const RECENT_IMAGE_WINDOW_MILLIS: u64 = 10 * 60 * 1_000;
+const HISTORICAL_IMAGE_CONTEXT_MARKER: &str = "\n[视觉上下文：当前消息是在询问本会话中此前发送的一张图片。本轮的图片内容块对应这张历史图片；请依据实际视觉内容回答。]";
 
 /// Return image URLs that are safe to pass through unchanged. Signed or
 /// otherwise cache-only URLs are intentionally omitted; callers that need
@@ -1209,52 +1237,140 @@ fn vision_media_urls(message: &InMessage) -> Vec<String> {
 }
 
 fn asks_about_recent_image(content: &str) -> bool {
-    [
+    let content = compact_reference_text(content);
+    if content.is_empty() {
+        return false;
+    }
+
+    const DIRECT_IMAGE_REFERENCES: &[&str] = &[
         "这图",
         "这个图",
+        "那图",
         "那张图",
-        "图片",
-        "表情包",
-        "表情",
+        "这张图",
+        "上一张图",
+        "上面那张图",
+        "前面那张图",
         "什么意思",
         "啥意思",
         "什么含义",
+    ];
+    if DIRECT_IMAGE_REFERENCES
+        .iter()
+        .any(|marker| content.contains(marker))
+    {
+        return true;
+    }
+
+    const IMAGE_WORDS: &[&str] = &["图片", "图", "照片", "表情包", "表情", "动图", "梗图"];
+    const HISTORY_REFERENCES: &[&str] = &[
+        "我发的",
+        "我刚发",
+        "我刚刚发",
+        "刚发的",
+        "刚刚发的",
+        "上面",
+        "前面",
+        "上一张",
+        "上张",
+        "上条",
+        "刚才",
+    ];
+    const VISUAL_QUESTIONS: &[&str] = &[
+        "看得懂",
+        "看的懂",
+        "看懂",
+        "看明白",
+        "看的明白",
+        "看得明白",
+        "看清",
+        "看清楚",
+        "看到了",
+        "看见",
+        "看不懂",
+        "看不明白",
         "看一下",
         "看下",
         "看图",
-    ]
-    .iter()
-    .any(|marker| content.contains(marker))
+        "懂吗",
+        "明白吗",
+    ];
+
+    let mentions_image = IMAGE_WORDS.iter().any(|marker| content.contains(marker));
+    let references_history = HISTORY_REFERENCES
+        .iter()
+        .any(|marker| content.contains(marker));
+    let asks_visual_question = VISUAL_QUESTIONS
+        .iter()
+        .any(|marker| content.contains(marker));
+
+    (mentions_image && (references_history || asks_visual_question))
+        || (references_history && asks_visual_question)
 }
 
-fn attach_recent_referenced_image(
-    messages: &mut [ChatMessage],
+fn compact_reference_text(content: &str) -> String {
+    content
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+fn refers_to_own_recent_image(content: &str) -> bool {
+    let content = compact_reference_text(content);
+    ["我发的", "我刚发", "我刚刚发", "我上面发的", "我前面发的"]
+        .iter()
+        .any(|marker| content.contains(marker))
+}
+
+fn referenced_history_image<'a>(
     current: &InMessage,
-    history: &[memory::short::ContextMessage],
-) {
-    if !current.media.is_empty() || !asks_about_recent_image(&current.content) {
-        return;
+    history: &'a [memory::short::ContextMessage],
+) -> Option<&'a memory::short::ContextMessage> {
+    if current.media.iter().any(is_image_media) || !asks_about_recent_image(&current.content) {
+        return None;
     }
-    if messages.iter().any(ChatMessage::has_images) {
-        return;
+
+    if refers_to_own_recent_image(&current.content) {
+        recent_history_image(current, history, true)
+            .or_else(|| recent_history_image(current, history, false))
+    } else {
+        recent_history_image(current, history, false)
     }
-    let recent = history.iter().rev().find(|item| {
-        !item.media.is_empty()
+}
+
+fn recent_history_image<'a>(
+    current: &InMessage,
+    history: &'a [memory::short::ContextMessage],
+    require_current_speaker: bool,
+) -> Option<&'a memory::short::ContextMessage> {
+    let current_speaker = memory::short::speaker_label(current);
+    history.iter().rev().find(|item| {
+        item.event_key != current.event_key
+            && (!require_current_speaker || item.speaker == current_speaker)
+            && item.media.iter().any(is_image_media)
             && (current.timestamp <= 0
                 || item.timestamp <= 0
-                || current.timestamp.saturating_sub(item.timestamp).abs() <= 10 * 60 * 1_000)
-    });
-    let Some(recent) = recent else {
-        return;
-    };
-    let urls = recent
+                || current.timestamp.abs_diff(item.timestamp) <= RECENT_IMAGE_WINDOW_MILLIS)
+    })
+}
+
+fn attach_referenced_history_image(
+    messages: &mut [ChatMessage],
+    referenced_image: &memory::short::ContextMessage,
+) -> bool {
+    if messages.iter().any(ChatMessage::has_images) {
+        return false;
+    }
+    let urls = referenced_image
         .media
         .iter()
         .filter(|media| is_image_media(media))
         .map(|media| media.url.clone())
+        .filter(|url| !url.trim().is_empty())
+        .take(4)
         .collect::<Vec<_>>();
     if urls.is_empty() {
-        return;
+        return false;
     }
     if let Some(current_message) = messages
         .iter_mut()
@@ -1262,7 +1378,10 @@ fn attach_recent_referenced_image(
         .find(|message| matches!(message.role, Role::User))
     {
         current_message.image_urls = urls;
+        current_message.vision_required = true;
+        return true;
     }
+    false
 }
 
 async fn prepare_vision_messages(messages: &mut [ChatMessage], timeout_ms: u64) -> usize {
@@ -1335,7 +1454,7 @@ fn agent_tools() -> Vec<ChatTool> {
         },
         ChatTool {
             name: "recent_media_status".to_string(),
-            description: "确认当前消息或最近消息是否带有图片。图片本身会作为视觉输入附在对话里；不要把 URL 复述给用户。".to_string(),
+            description: "确认当前消息或近期历史消息是否带有图片。图片本身会作为视觉输入附在对话里；不要把 URL 复述给用户。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {},
@@ -1415,7 +1534,7 @@ fn search_history_tool(arguments: &Value, current: &InMessage) -> Value {
         &current.protocol,
         &current.session_type,
         &current.session_id,
-        current_config().behavior.max_context_tokens,
+        u32::MAX,
     );
     let mut matches = history
         .iter()
@@ -1470,10 +1589,21 @@ async fn search_memory_tool(arguments: &Value, current: &InMessage) -> Value {
 }
 
 fn recent_media_status_tool(current: &InMessage) -> Value {
+    let history = memory::short_context(
+        &current.protocol,
+        &current.session_type,
+        &current.session_id,
+        current_config().behavior.max_context_tokens,
+    );
+    let recent_history = recent_history_image(current, &history, false);
     json!({
         "current_message_images": current.media.iter().filter(|media| is_image_media(media)).count(),
         "current_message_has_media": current.has_media,
-        "instruction": "若图片输入存在，只依据视觉内容回答；若不存在，明确说明看不到图片，不要猜测。"
+        "recent_history_has_image": recent_history.is_some(),
+        "recent_history_images": recent_history
+            .map(|item| item.media.iter().filter(|media| is_image_media(media)).count())
+            .unwrap_or(0),
+        "instruction": "若图片输入存在，只依据视觉内容回答；若近期历史有图片，先检查该图片是否已作为视觉输入附上；若未附上或加载失败，只能说明无法读取，不要说用户没有发图。"
     })
 }
 
@@ -2077,6 +2207,71 @@ mod tests {
         ];
         let urls = vision_media_urls(&message);
         assert_eq!(urls, vec!["https://example.test/public.png"]);
+    }
+
+    #[test]
+    fn recognizes_natural_history_image_references() {
+        for content in [
+            "我发的图你看的明白吗",
+            "你看得懂我刚发的图吗",
+            "上一张图你看清了吗",
+            "前面的表情包是什么含义",
+        ] {
+            assert!(asks_about_recent_image(content), "should match: {content}");
+        }
+        assert!(!asks_about_recent_image("我发了一段文字，你看明白了吗"));
+    }
+
+    #[test]
+    fn self_referenced_history_image_is_attached_for_vision() {
+        let mut current = request_message("我发的图你看的明白吗", true);
+        current.event_key = "current".to_string();
+        current.sender_id = "night-sky".to_string();
+        current.sender_name = "夜空".to_string();
+        current.timestamp = 600_000;
+        let own_speaker = memory::short::speaker_label(&current);
+        let history = vec![
+            memory::short::ContextMessage {
+                event_key: "own-image".to_string(),
+                role: "user".to_string(),
+                content: "[收到 1 个媒体附件]".to_string(),
+                speaker: own_speaker.clone(),
+                timestamp: 599_000,
+                is_key: false,
+                media: vec![MediaRef {
+                    url: "https://example.test/own-image.png".to_string(),
+                    media_type: "image/png".to_string(),
+                }],
+            },
+            memory::short::ContextMessage {
+                event_key: "other-image".to_string(),
+                role: "user".to_string(),
+                content: "[收到 1 个媒体附件]".to_string(),
+                speaker: "其他成员#123456".to_string(),
+                timestamp: 599_500,
+                is_key: false,
+                media: vec![MediaRef {
+                    url: "https://example.test/other-image.png".to_string(),
+                    media_type: "image/png".to_string(),
+                }],
+            },
+        ];
+
+        let referenced = referenced_history_image(&current, &history)
+            .expect("the sender's own image should be selected");
+        assert_eq!(referenced.speaker, own_speaker);
+
+        let mut messages = vec![ChatMessage::user(format!(
+            "{}{}",
+            current.content, HISTORICAL_IMAGE_CONTEXT_MARKER
+        ))];
+        assert!(attach_referenced_history_image(&mut messages, referenced));
+        assert_eq!(
+            messages[0].image_urls,
+            vec!["https://example.test/own-image.png"]
+        );
+        assert!(messages[0].vision_required);
+        assert!(messages[0].content.contains("本会话中此前发送的一张图片"));
     }
 
     #[test]
