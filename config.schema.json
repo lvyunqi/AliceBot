@@ -107,7 +107,7 @@
               "api_key": {
                 "type": "string",
                 "title": "API 密钥",
-                "description": "API 密钥，不会回传明文",
+                "description": "API 密钥，不会回传明文；清除后该 provider 不参与调用，重新填写须通过密钥专用通道",
                 "writeOnly": true,
                 "x-qimen-secret": true,
                 "minLength": 1
@@ -131,7 +131,7 @@
                 "default": 1
               }
             },
-            "required": ["id", "protocol", "base_url", "api_key", "model"]
+            "required": ["id", "protocol", "base_url", "model"]
           }
         }
       }
@@ -341,6 +341,67 @@
         }
       }
     },
+    "privacy": {
+      "type": "object",
+      "title": "隐私与保留",
+      "description": "控制脱敏原始事件和未引用消息 journal 的保留边界",
+      "properties": {
+        "store_raw_events": {
+          "type": "boolean",
+          "title": "保存脱敏原始事件",
+          "description": "关闭后不再写入 raw_json；幂等、路由和最小消息字段仍会保留",
+          "default": true
+        },
+        "raw_event_retention_days": {
+          "type": "integer",
+          "title": "原始事件保留天数",
+          "description": "超过期限仅清理已脱敏 raw_json，不影响仍需保留的最小 journal 行",
+          "minimum": 1,
+          "maximum": 3650,
+          "default": 30
+        },
+        "message_retention_days": {
+          "type": "integer",
+          "title": "消息 journal 保留天数",
+          "description": "只清理未被记忆、知识、决策或出站审计引用且已完成的入站事件",
+          "minimum": 1,
+          "maximum": 3650,
+          "default": 180
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "title": "观测与排错",
+      "description": "控制脱敏审计、指标和短时协议排错输出",
+      "properties": {
+        "level": {
+          "type": "string",
+          "title": "诊断级别",
+          "description": "AliceBot 诊断的最低级别；raw_protocol_debug 只能在 debug 或 trace 下启用",
+          "enum": ["error", "warn", "info", "debug", "trace"],
+          "default": "info"
+        },
+        "decision_trace": {
+          "type": "boolean",
+          "title": "保存决策轨迹",
+          "description": "保存不含提示词和响应正文的可回放决策轨迹",
+          "default": true
+        },
+        "llm_metrics": {
+          "type": "boolean",
+          "title": "保存 LLM 指标",
+          "description": "保存调用耗时、字符数、状态和错误分类，不保存提示词或响应正文",
+          "default": true
+        },
+        "raw_protocol_debug": {
+          "type": "boolean",
+          "title": "临时协议排错",
+          "description": "输出已脱敏的原始协议事件，仅用于短时排错，可能包含用户内容",
+          "default": false
+        }
+      }
+    },
     "stickers": {
       "type": "object",
       "title": "表情包策略",
@@ -356,6 +417,44 @@
           "title": "自动收藏",
           "description": "遇到合适图片时自动收藏为表情包",
           "default": true
+        },
+        "daily_collect_limit": {
+          "type": "integer",
+          "title": "每日收藏上限",
+          "description": "每天最多新增收藏的图片数量，重复来源不重复占用名额",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 100
+        },
+        "cache_media": {
+          "type": "boolean",
+          "title": "缓存收藏媒体",
+          "description": "异步下载收藏图片到插件数据目录，以内容哈希去重",
+          "default": true
+        },
+        "cache_max_file_mib": {
+          "type": "integer",
+          "title": "单文件缓存上限",
+          "description": "单张收藏媒体可写入本地缓存的最大体积",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 8
+        },
+        "cache_max_total_mib": {
+          "type": "integer",
+          "title": "总缓存上限",
+          "description": "所有已缓存媒体可占用的最大本地体积，超过后保留 URL-only 记录",
+          "minimum": 16,
+          "maximum": 1024,
+          "default": 256
+        },
+        "cache_timeout_sec": {
+          "type": "integer",
+          "title": "缓存下载超时",
+          "description": "单张媒体下载的最长等待时间",
+          "minimum": 1,
+          "maximum": 60,
+          "default": 15
         },
         "collect_probability": {
           "type": "number",
@@ -373,6 +472,22 @@
           "maximum": 1,
           "default": 0.4
         },
+        "daily_send_limit": {
+          "type": "integer",
+          "title": "每日发送上限",
+          "description": "每天最多接受发送的表情包 URL 数量",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 30
+        },
+        "sticker_cooldown_sec": {
+          "type": "integer",
+          "title": "表情包冷却",
+          "description": "同一会话两次自动表情包发送之间的最小间隔",
+          "minimum": 0,
+          "maximum": 86400,
+          "default": 300
+        },
         "link_enabled": {
           "type": "boolean",
           "title": "联想串联",
@@ -384,8 +499,8 @@
           "title": "最大串联数",
           "description": "一次最多连续发送几张表情包",
           "minimum": 1,
-          "maximum": 10,
-          "default": 3
+          "maximum": 3,
+          "default": 2
         }
       }
     },

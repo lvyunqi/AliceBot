@@ -327,6 +327,9 @@ fn begin_audit(
     attempt: u32,
     input_chars: usize,
 ) -> Option<i64> {
+    if !crate::pipeline::current_config().observability.llm_metrics {
+        return None;
+    }
     let database = crate::pipeline::try_db()?;
     match database.begin_llm_call(
         task,

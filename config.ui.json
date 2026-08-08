@@ -110,8 +110,35 @@
         "step": 0.01
       }
     },
+    "privacy": {
+      "ui:order": ["store_raw_events", "raw_event_retention_days", "message_retention_days"],
+      "raw_event_retention_days": {
+        "unit": "天"
+      },
+      "message_retention_days": {
+        "unit": "天"
+      }
+    },
+    "observability": {
+      "ui:order": ["level", "decision_trace", "llm_metrics", "raw_protocol_debug"],
+      "level": {
+        "ui:widget": "select"
+      }
+    },
     "stickers": {
-      "ui:order": ["enabled", "auto_collect", "collect_probability", "send_probability", "link_enabled", "max_chain"],
+      "ui:order": ["enabled", "auto_collect", "daily_collect_limit", "cache_media", "cache_max_file_mib", "cache_max_total_mib", "cache_timeout_sec", "collect_probability", "send_probability", "daily_send_limit", "sticker_cooldown_sec", "link_enabled", "max_chain"],
+      "daily_collect_limit": {
+        "unit": "张/天"
+      },
+      "cache_max_file_mib": {
+        "unit": "MiB"
+      },
+      "cache_max_total_mib": {
+        "unit": "MiB"
+      },
+      "cache_timeout_sec": {
+        "unit": "秒"
+      },
       "collect_probability": {
         "ui:widget": "slider",
         "unit": ""
@@ -119,6 +146,12 @@
       "send_probability": {
         "ui:widget": "slider",
         "unit": ""
+      },
+      "daily_send_limit": {
+        "unit": "张/天"
+      },
+      "sticker_cooldown_sec": {
+        "unit": "秒"
       },
       "max_chain": {
         "unit": "张"

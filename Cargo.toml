@@ -16,7 +16,7 @@ qimen-dynamic-plugin-derive = "0.1.13"
 abi_stable = "0.11"
 
 # 异步运行时（插件自建）
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "parking_lot", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "parking_lot", "time", "fs", "io-util", "net"] }
 
 # 数据库
 rusqlite = { version = "0.34", features = ["backup", "bundled"] }

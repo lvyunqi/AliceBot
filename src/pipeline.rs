@@ -7,6 +7,7 @@ use abi_stable_host_api::{CommandRequest, InterceptorRequest};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::config::AppConfig;
@@ -114,6 +115,7 @@ static COMMAND_SUPPRESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 struct PipelineState {
     config: AppConfig,
     llm: LlmClient,
+    sticker_cache_root: PathBuf,
 }
 
 fn db_slot() -> &'static Mutex<Option<Arc<Database>>> {
@@ -128,10 +130,11 @@ fn command_suppression_slot() -> &'static Mutex<HashSet<String>> {
     COMMAND_SUPPRESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-pub fn set_config(config: AppConfig) {
+pub fn set_config(config: AppConfig, sticker_cache_root: PathBuf) {
     let state = Arc::new(PipelineState {
         llm: LlmClient::from_config(&config.llm),
         config,
+        sticker_cache_root,
     });
     if let Ok(mut slot) = state_slot().lock() {
         *slot = Some(state);
@@ -180,6 +183,15 @@ pub fn current_config() -> AppConfig {
         .unwrap_or_default()
 }
 
+/// Return the current plugin-local root for content-addressed sticker files.
+pub(crate) fn sticker_cache_root() -> Option<PathBuf> {
+    state_slot()
+        .lock()
+        .ok()?
+        .as_ref()
+        .map(|state| state.sticker_cache_root.clone())
+}
+
 fn state() -> Option<Arc<PipelineState>> {
     state_slot().lock().ok()?.as_ref().cloned()
 }
@@ -222,6 +234,11 @@ pub fn record_inbound(event: InboundEvent) -> Result<Option<InMessage>, String> 
     }
 }
 
+/// 从命令请求复制并规范化遗忘命令所需的协议和主体边界。
+pub(crate) fn normalize_command_message(req: &CommandRequest, text: &str) -> InMessage {
+    normalize_message(&InboundEvent::from_command(req, text))
+}
+
 /// 处理已写入 journal 的消息；即使决策选择静默，也会完成处理状态记录。
 pub async fn process_recorded_message(msg: InMessage) {
     let Some(database) = try_db() else {
@@ -260,18 +277,30 @@ async fn process_recorded_message_inner(msg: InMessage) {
     let config = current_config();
     if config.stickers.enabled && config.stickers.auto_collect {
         let mut sticker_ids = Vec::new();
+        let cache_policy = config
+            .stickers
+            .cache_media
+            .then(|| stickers::cache::CachePolicy::from_config(&config.stickers));
+        let cache_root = sticker_cache_root();
         for media in &msg.media {
-            if let Some(sticker_id) = stickers::collect::maybe_collect_with_metadata(
+            if let Some(collected) = stickers::collect::maybe_collect_with_metadata(
                 &media.url,
                 &msg.content,
                 &msg.protocol,
                 &msg.sender_id,
                 &msg.session_id,
-                config.stickers.collect_probability,
+                stickers::collect::CollectionPolicy {
+                    probability: config.stickers.collect_probability,
+                    daily_collect_limit: config.stickers.daily_collect_limit,
+                    cache: cache_policy.zip(cache_root.clone()),
+                },
             )
             .await
             {
-                sticker_ids.push(sticker_id);
+                sticker_ids.push(collected.sticker_id);
+                if let Some(cache_task) = collected.cache_task {
+                    let _ = crate::RUNTIME.submit_sticker_cache(cache_task);
+                }
             }
         }
         if config.stickers.link_enabled {
@@ -335,23 +364,36 @@ async fn process_recorded_message_inner(msg: InMessage) {
             } else {
                 1
             };
-            for (index, (_, url)) in
-                stickers::send::choose_chain(&msg.session_id, keyword, max_chain)
-                    .await
-                    .into_iter()
-                    .enumerate()
+            let sticker_policy = stickers::send::SendPolicy {
+                max_chain,
+                daily_send_limit: config.stickers.daily_send_limit,
+                cooldown_sec: config.stickers.sticker_cooldown_sec,
+            };
+            for (index, candidate) in stickers::send::choose_chain_for_route(
+                &msg.protocol,
+                &msg.session_type,
+                &msg.session_id,
+                keyword,
+                sticker_policy,
+            )
+            .await
+            .into_iter()
+            .enumerate()
             {
                 let sticker_event_key = format!("{}:sticker:{index}", msg.event_key);
-                let _ = send::send_image_url_for_event(
+                let accepted = send::send_image_url_for_event(
                     &msg.bot_account_id,
                     &msg.protocol,
                     &msg.session_id,
                     &msg.session_type,
-                    &url,
+                    &candidate.url,
                     None,
                     Some(&sticker_event_key),
                 )
                 .await;
+                if accepted {
+                    stickers::send::record_accepted_delivery(candidate.sticker_id, &msg.protocol);
+                }
             }
         }
     }
@@ -485,7 +527,7 @@ fn normalize_message(event: &InboundEvent) -> InMessage {
         format!("{protocol}:{message_id}")
     };
 
-    InMessage {
+    let message = InMessage {
         event_key,
         protocol,
         bot_account_id,
@@ -501,7 +543,19 @@ fn normalize_message(event: &InboundEvent) -> InMessage {
         at_me,
         timestamp,
         safe_raw_json,
+    };
+    if crate::pipeline::current_config()
+        .observability
+        .raw_protocol_debug_enabled()
+    {
+        // 这里只输出已经过凭据和媒体 URL 脱敏的 JSON，仍可能包含用户内容，只允许短时排错。
+        log::debug!(
+            target: "alicebot_raw_message",
+            "[AliceBot] normalized inbound event: {}",
+            message.safe_raw_json.as_str()
+        );
     }
+    message
 }
 
 fn is_official_qq(root: &Value, payload: &Value, native_payload: &Value) -> bool {
@@ -874,33 +928,93 @@ fn persona_prompt(config: &AppConfig) -> String {
     format!("{base}\n{typo_instruction}\n{emoji_instruction}")
 }
 
-/// 获取状态（/status 命令）。
-pub async fn get_status() -> String {
-    struct StatusMetrics {
-        message_count: i64,
-        record_only_messages: i64,
-        llm_success: i64,
-        llm_errors: i64,
-        outbound_accepted: i64,
-        outbound_failures: i64,
-        decision_replies: i64,
-        decision_batches: i64,
-        active_sessions: i64,
-        average_activity: f64,
-        memory_candidates: i64,
-        memory_active: i64,
-        memory_forgotten: i64,
-        memory_sources: i64,
-        personas: i64,
-        persona_nicknames: i64,
-        persona_topics: i64,
-        knowledge_candidates: i64,
-        knowledge_active: i64,
-        knowledge_forgotten: i64,
-        knowledge_sources: i64,
-        compactions: i64,
-    }
+struct StatusMetrics {
+    message_count: i64,
+    record_only_messages: i64,
+    llm_success: i64,
+    llm_errors: i64,
+    outbound_accepted: i64,
+    outbound_failures: i64,
+    decision_replies: i64,
+    decision_batches: i64,
+    active_sessions: i64,
+    average_activity: f64,
+    memory_candidates: i64,
+    memory_active: i64,
+    memory_forgotten: i64,
+    memory_sources: i64,
+    personas: i64,
+    persona_nicknames: i64,
+    persona_topics: i64,
+    knowledge_candidates: i64,
+    knowledge_active: i64,
+    knowledge_forgotten: i64,
+    knowledge_sources: i64,
+    compactions: i64,
+}
 
+impl StatusMetrics {
+    fn unavailable() -> Self {
+        Self {
+            message_count: -1,
+            record_only_messages: -1,
+            llm_success: -1,
+            llm_errors: -1,
+            outbound_accepted: -1,
+            outbound_failures: -1,
+            decision_replies: -1,
+            decision_batches: -1,
+            active_sessions: -1,
+            average_activity: -1.0,
+            memory_candidates: -1,
+            memory_active: -1,
+            memory_forgotten: -1,
+            memory_sources: -1,
+            personas: -1,
+            persona_nicknames: -1,
+            persona_topics: -1,
+            knowledge_candidates: -1,
+            knowledge_active: -1,
+            knowledge_forgotten: -1,
+            knowledge_sources: -1,
+            compactions: -1,
+        }
+    }
+}
+
+/// Serialize only fixed aggregate counters for the administrator status command.
+fn render_status(metrics: StatusMetrics) -> String {
+    json!({
+        "status": "running",
+        "message_count": metrics.message_count,
+        "record_only_messages": metrics.record_only_messages,
+        "llm_success": metrics.llm_success,
+        "llm_errors": metrics.llm_errors,
+        "outbound_accepted": metrics.outbound_accepted,
+        "outbound_failures": metrics.outbound_failures,
+        "decision_replies": metrics.decision_replies,
+        "decision_batches": metrics.decision_batches,
+        "active_sessions": metrics.active_sessions,
+        "average_activity": metrics.average_activity,
+        "memory_candidates": metrics.memory_candidates,
+        "memory_active": metrics.memory_active,
+        "memory_forgotten": metrics.memory_forgotten,
+        "memory_sources": metrics.memory_sources,
+        "personas": metrics.personas,
+        "persona_nicknames": metrics.persona_nicknames,
+        "persona_topics": metrics.persona_topics,
+        "knowledge_candidates": metrics.knowledge_candidates,
+        "knowledge_active": metrics.knowledge_active,
+        "knowledge_forgotten": metrics.knowledge_forgotten,
+        "knowledge_sources": metrics.knowledge_sources,
+        "compactions": metrics.compactions,
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+    .to_string()
+}
+
+/// 获取管理员状态（/status 命令）。
+pub async fn get_status() -> String {
     let metrics = try_db().and_then(|database| {
         let connection = database.conn.lock().ok()?;
         let count = |sql: &str| {
@@ -948,58 +1062,7 @@ pub async fn get_status() -> String {
             compactions: count("SELECT COUNT(*) FROM compaction_runs WHERE status = 'completed'"),
         })
     });
-    let metrics = metrics.unwrap_or(StatusMetrics {
-        message_count: -1,
-        record_only_messages: -1,
-        llm_success: -1,
-        llm_errors: -1,
-        outbound_accepted: -1,
-        outbound_failures: -1,
-        decision_replies: -1,
-        decision_batches: -1,
-        active_sessions: -1,
-        average_activity: -1.0,
-        memory_candidates: -1,
-        memory_active: -1,
-        memory_forgotten: -1,
-        memory_sources: -1,
-        personas: -1,
-        persona_nicknames: -1,
-        persona_topics: -1,
-        knowledge_candidates: -1,
-        knowledge_active: -1,
-        knowledge_forgotten: -1,
-        knowledge_sources: -1,
-        compactions: -1,
-    });
-
-    json!({
-        "status": "running",
-        "message_count": metrics.message_count,
-        "record_only_messages": metrics.record_only_messages,
-        "llm_success": metrics.llm_success,
-        "llm_errors": metrics.llm_errors,
-        "outbound_accepted": metrics.outbound_accepted,
-        "outbound_failures": metrics.outbound_failures,
-        "decision_replies": metrics.decision_replies,
-        "decision_batches": metrics.decision_batches,
-        "active_sessions": metrics.active_sessions,
-        "average_activity": metrics.average_activity,
-        "memory_candidates": metrics.memory_candidates,
-        "memory_active": metrics.memory_active,
-        "memory_forgotten": metrics.memory_forgotten,
-        "memory_sources": metrics.memory_sources,
-        "personas": metrics.personas,
-        "persona_nicknames": metrics.persona_nicknames,
-        "persona_topics": metrics.persona_topics,
-        "knowledge_candidates": metrics.knowledge_candidates,
-        "knowledge_active": metrics.knowledge_active,
-        "knowledge_forgotten": metrics.knowledge_forgotten,
-        "knowledge_sources": metrics.knowledge_sources,
-        "compactions": metrics.compactions,
-        "version": env!("CARGO_PKG_VERSION"),
-    })
-    .to_string()
+    render_status(metrics.unwrap_or_else(StatusMetrics::unavailable))
 }
 
 #[cfg(test)]
@@ -1184,5 +1247,81 @@ mod tests {
         suppress_autonomous_reply_for_command(&request);
         assert!(take_command_suppression(&interceptor_event_key));
         assert!(!take_command_suppression(&interceptor_event_key));
+    }
+
+    #[test]
+    fn status_serialization_is_limited_to_fixed_aggregate_fields() {
+        let rendered = render_status(StatusMetrics {
+            message_count: 1,
+            record_only_messages: 2,
+            llm_success: 3,
+            llm_errors: 4,
+            outbound_accepted: 5,
+            outbound_failures: 6,
+            decision_replies: 7,
+            decision_batches: 8,
+            active_sessions: 9,
+            average_activity: 0.25,
+            memory_candidates: 10,
+            memory_active: 11,
+            memory_forgotten: 12,
+            memory_sources: 13,
+            personas: 14,
+            persona_nicknames: 15,
+            persona_topics: 16,
+            knowledge_candidates: 17,
+            knowledge_active: 18,
+            knowledge_forgotten: 19,
+            knowledge_sources: 20,
+            compactions: 21,
+        });
+        let value: Value = serde_json::from_str(&rendered).expect("status must be valid JSON");
+        let keys: std::collections::BTreeSet<_> = value
+            .as_object()
+            .expect("status must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected = [
+            "active_sessions",
+            "average_activity",
+            "compactions",
+            "decision_batches",
+            "decision_replies",
+            "knowledge_active",
+            "knowledge_candidates",
+            "knowledge_forgotten",
+            "knowledge_sources",
+            "llm_errors",
+            "llm_success",
+            "memory_active",
+            "memory_candidates",
+            "memory_forgotten",
+            "memory_sources",
+            "message_count",
+            "outbound_accepted",
+            "outbound_failures",
+            "persona_nicknames",
+            "persona_topics",
+            "personas",
+            "record_only_messages",
+            "status",
+            "version",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+        for forbidden in [
+            "sender_id",
+            "session_id",
+            "content",
+            "raw_json",
+            "media_url",
+            "api_key",
+            "prompt",
+            "response",
+        ] {
+            assert!(!rendered.contains(forbidden));
+        }
     }
 }

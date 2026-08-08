@@ -477,6 +477,26 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_candidates_never_create_persistent_memory_rows() {
+        let database = Database::open(":memory:").unwrap();
+        let sensitive = message(
+            "memory:sensitive",
+            "我喜欢旅游，我的 API KEY 是 secret-value",
+            10,
+        );
+        let candidates = extract(&sensitive);
+        assert!(candidates.is_empty());
+        let stats = apply(&database, &sensitive, &candidates).unwrap();
+        assert_eq!(stats, UpdateStats::default());
+
+        let connection = database.conn.lock().unwrap();
+        let rows: i64 = connection
+            .query_row("SELECT COUNT(*) FROM long_memory", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
     fn distinct_sources_promote_candidate_and_duplicate_source_does_not_reinforce() {
         let database = Database::open(":memory:").unwrap();
         let first = message("memory:preference:1", "我喜欢咖啡。", 10);

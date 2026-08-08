@@ -30,6 +30,12 @@ pub struct AppConfig {
     pub memories: MemoryConfig,
 
     #[serde(default)]
+    pub privacy: PrivacyConfig,
+
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
+
+    #[serde(default)]
     pub stickers: StickerConfig,
 
     #[serde(default)]
@@ -45,6 +51,8 @@ impl fmt::Debug for AppConfig {
             .field("behavior", &self.behavior)
             .field("decision", &self.decision)
             .field("memories", &self.memories)
+            .field("privacy", &self.privacy)
+            .field("observability", &self.observability)
             .field("stickers", &self.stickers)
             .field("send", &"[REDACTED]")
             .finish()
@@ -403,6 +411,82 @@ impl Default for MemoryConfig {
     }
 }
 
+/// 原始事件和消息 journal 的隐私保留边界。
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrivacyConfig {
+    /// 是否在 journal 中保存已经脱敏的原始事件 JSON。
+    #[serde(default = "default_true")]
+    pub store_raw_events: bool,
+
+    /// 原始事件 JSON 的最长保留天数，正文 journal 可继续保留。
+    #[serde(default = "default_raw_event_retention_days")]
+    pub raw_event_retention_days: u32,
+
+    /// 未被派生数据引用的已完成入站事件最长保留天数。
+    #[serde(default = "default_message_retention_days")]
+    pub message_retention_days: u32,
+}
+
+fn default_raw_event_retention_days() -> u32 {
+    30
+}
+
+fn default_message_retention_days() -> u32 {
+    180
+}
+
+impl Default for PrivacyConfig {
+    fn default() -> Self {
+        Self {
+            store_raw_events: true,
+            raw_event_retention_days: default_raw_event_retention_days(),
+            message_retention_days: default_message_retention_days(),
+        }
+    }
+}
+
+/// 脱敏审计和临时协议诊断的开关。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservabilityConfig {
+    /// AliceBot 可选诊断的最低日志级别，不修改宿主全局日志过滤器。
+    #[serde(default = "default_observability_level")]
+    pub level: String,
+
+    /// 是否持久化可回放的脱敏决策轨迹。
+    #[serde(default = "default_true")]
+    pub decision_trace: bool,
+
+    /// 是否持久化不含提示词和响应正文的 LLM 调用指标。
+    #[serde(default = "default_true")]
+    pub llm_metrics: bool,
+
+    /// 是否输出已脱敏的原始协议事件，仅用于短时排错。
+    #[serde(default)]
+    pub raw_protocol_debug: bool,
+}
+
+fn default_observability_level() -> String {
+    "info".to_string()
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        Self {
+            level: default_observability_level(),
+            decision_trace: true,
+            llm_metrics: true,
+            raw_protocol_debug: false,
+        }
+    }
+}
+
+impl ObservabilityConfig {
+    /// 原始协议日志只能在显式调试级别下输出，避免普通信息日志泄露用户事件。
+    pub(crate) fn raw_protocol_debug_enabled(&self) -> bool {
+        self.raw_protocol_debug && matches!(self.level.as_str(), "debug" | "trace")
+    }
+}
+
 /// 表情包策略
 #[derive(Debug, Clone, Deserialize)]
 pub struct StickerConfig {
@@ -412,11 +496,39 @@ pub struct StickerConfig {
     #[serde(default = "default_true")]
     pub auto_collect: bool,
 
+    /// 每 UTC 日最多新增收藏的媒体数量。
+    #[serde(default = "default_daily_collect_limit")]
+    pub daily_collect_limit: u32,
+
+    /// 是否把已收藏的远程媒体异步缓存到插件数据目录。
+    #[serde(default = "default_true")]
+    pub cache_media: bool,
+
+    /// 单个缓存媒体的最大体积（MiB）。
+    #[serde(default = "default_cache_max_file_mib")]
+    pub cache_max_file_mib: u32,
+
+    /// 全部缓存媒体的最大体积（MiB）。
+    #[serde(default = "default_cache_max_total_mib")]
+    pub cache_max_total_mib: u32,
+
+    /// 单次媒体下载的超时秒数。
+    #[serde(default = "default_cache_timeout_sec")]
+    pub cache_timeout_sec: u64,
+
     #[serde(default = "default_collect_prob")]
     pub collect_probability: f32,
 
     #[serde(default = "default_send_prob")]
     pub send_probability: f32,
+
+    /// 每 UTC 日最多接受的表情包 URL 发送数。
+    #[serde(default = "default_daily_send_limit")]
+    pub daily_send_limit: u32,
+
+    /// 同一路由两次自动表情包发送的最小间隔。
+    #[serde(default = "default_sticker_cooldown_sec")]
+    pub sticker_cooldown_sec: u64,
 
     #[serde(default = "default_true")]
     pub link_enabled: bool,
@@ -428,11 +540,29 @@ pub struct StickerConfig {
 fn default_collect_prob() -> f32 {
     0.3
 }
+fn default_daily_collect_limit() -> u32 {
+    100
+}
+fn default_cache_max_file_mib() -> u32 {
+    8
+}
+fn default_cache_max_total_mib() -> u32 {
+    256
+}
+fn default_cache_timeout_sec() -> u64 {
+    15
+}
 fn default_send_prob() -> f32 {
     0.4
 }
+fn default_daily_send_limit() -> u32 {
+    30
+}
+fn default_sticker_cooldown_sec() -> u64 {
+    300
+}
 fn default_max_chain() -> u32 {
-    3
+    2
 }
 
 impl Default for StickerConfig {
@@ -440,8 +570,15 @@ impl Default for StickerConfig {
         Self {
             enabled: true,
             auto_collect: true,
+            daily_collect_limit: default_daily_collect_limit(),
+            cache_media: true,
+            cache_max_file_mib: default_cache_max_file_mib(),
+            cache_max_total_mib: default_cache_max_total_mib(),
+            cache_timeout_sec: default_cache_timeout_sec(),
             collect_probability: default_collect_prob(),
             send_probability: default_send_prob(),
+            daily_send_limit: default_daily_send_limit(),
+            sticker_cooldown_sec: default_sticker_cooldown_sec(),
             link_enabled: true,
             max_chain: default_max_chain(),
         }
@@ -498,6 +635,61 @@ fn validate(config: &AppConfig) -> Result<(), String> {
         return Err(format!(
             "memories.reflection_target_autonomous_rate must be between {MIN_REFLECTION_TARGET_AUTONOMOUS_RATE} and {MAX_REFLECTION_TARGET_AUTONOMOUS_RATE}"
         ));
+    }
+
+    let privacy = &config.privacy;
+    if !(1..=3_650).contains(&privacy.raw_event_retention_days) {
+        return Err("privacy.raw_event_retention_days must be between 1 and 3650".to_string());
+    }
+    if !(1..=3_650).contains(&privacy.message_retention_days) {
+        return Err("privacy.message_retention_days must be between 1 and 3650".to_string());
+    }
+    if privacy.raw_event_retention_days > privacy.message_retention_days {
+        return Err(
+            "privacy.raw_event_retention_days cannot exceed message_retention_days".to_string(),
+        );
+    }
+
+    let observability = &config.observability;
+    if !matches!(
+        observability.level.as_str(),
+        "error" | "warn" | "info" | "debug" | "trace"
+    ) {
+        return Err("observability.level must be error, warn, info, debug, or trace".to_string());
+    }
+    if observability.raw_protocol_debug && !observability.raw_protocol_debug_enabled() {
+        return Err(
+            "observability.raw_protocol_debug requires observability.level debug or trace"
+                .to_string(),
+        );
+    }
+
+    let stickers = &config.stickers;
+    if !(1..=1_000).contains(&stickers.daily_collect_limit) {
+        return Err("stickers.daily_collect_limit must be between 1 and 1000".to_string());
+    }
+    if !(1..=32).contains(&stickers.cache_max_file_mib) {
+        return Err("stickers.cache_max_file_mib must be between 1 and 32".to_string());
+    }
+    if !(16..=1_024).contains(&stickers.cache_max_total_mib) {
+        return Err("stickers.cache_max_total_mib must be between 16 and 1024".to_string());
+    }
+    if stickers.cache_max_total_mib < stickers.cache_max_file_mib {
+        return Err(
+            "stickers.cache_max_total_mib cannot be smaller than cache_max_file_mib".to_string(),
+        );
+    }
+    if !(1..=60).contains(&stickers.cache_timeout_sec) {
+        return Err("stickers.cache_timeout_sec must be between 1 and 60".to_string());
+    }
+    if !(1..=1_000).contains(&stickers.daily_send_limit) {
+        return Err("stickers.daily_send_limit must be between 1 and 1000".to_string());
+    }
+    if stickers.sticker_cooldown_sec > 86_400 {
+        return Err("stickers.sticker_cooldown_sec cannot exceed 86400".to_string());
+    }
+    if !(1..=3).contains(&stickers.max_chain) {
+        return Err("stickers.max_chain must be between 1 and 3".to_string());
     }
 
     let mut provider_ids = HashSet::new();
@@ -639,6 +831,21 @@ mod tests {
         assert!(schema["properties"]["decision"].is_object());
         assert!(schema["properties"]["decision"]["properties"]["reply_judge_enabled"].is_object());
         assert!(schema["properties"]["memories"]["properties"]["reflection_enabled"].is_object());
+        assert!(schema["properties"]["privacy"]["properties"]["store_raw_events"].is_object());
+        assert!(schema["properties"]["observability"]["properties"]["decision_trace"].is_object());
+        assert!(schema["properties"]["stickers"]["properties"]["daily_collect_limit"].is_object());
+        let provider_required =
+            schema["properties"]["llm"]["properties"]["providers"]["items"]["required"]
+                .as_array()
+                .expect("provider required fields should be an array");
+        assert!(
+            !provider_required
+                .iter()
+                .any(|field| field.as_str() == Some("api_key"))
+        );
+        assert!(
+            schema["properties"]["privacy"]["properties"]["raw_event_retention_days"].is_object()
+        );
         assert!(schema["properties"]["behavior"]["properties"]["reply_bias"].is_null());
         assert!(schema["properties"]["behavior"]["properties"]["min_interval_sec"].is_null());
     }
@@ -650,5 +857,119 @@ mod tests {
         let config = parse_and_validate_config(r#"{"decision":{"reply_judge_enabled":true}}"#)
             .expect("reply judge configuration should be valid");
         assert!(config.decision.reply_judge_enabled);
+    }
+
+    #[test]
+    fn provider_without_api_key_represents_a_cleared_secret() {
+        let config = parse_and_validate_config(
+            r#"{
+                "llm":{"providers":[{
+                    "id":"cleared",
+                    "protocol":"openai",
+                    "base_url":"https://example.test/v1",
+                    "model":"test-model"
+                }]}
+            }"#,
+        )
+        .expect("a provider without a secret should remain a valid disabled route");
+        assert_eq!(config.llm.providers[0].api_key, "");
+    }
+
+    #[test]
+    fn privacy_defaults_keep_raw_events_bounded_and_validated() {
+        let defaults = AppConfig::default().privacy;
+        assert!(defaults.store_raw_events);
+        assert_eq!(defaults.raw_event_retention_days, 30);
+        assert_eq!(defaults.message_retention_days, 180);
+
+        let config = parse_and_validate_config(
+            r#"{"privacy":{"store_raw_events":false,"raw_event_retention_days":7,"message_retention_days":14}}"#,
+        )
+        .expect("privacy configuration should be valid");
+        assert!(!config.privacy.store_raw_events);
+        assert_eq!(config.privacy.raw_event_retention_days, 7);
+        assert_eq!(config.privacy.message_retention_days, 14);
+    }
+
+    #[test]
+    fn privacy_validation_rejects_unbounded_or_inverted_retention() {
+        let too_long = parse_and_validate_config(r#"{"privacy":{"message_retention_days":3651}}"#)
+            .expect_err("retention beyond the hard limit should fail");
+        assert!(too_long.contains("message_retention_days"));
+
+        let inverted = parse_and_validate_config(
+            r#"{"privacy":{"raw_event_retention_days":31,"message_retention_days":30}}"#,
+        )
+        .expect_err("raw retention beyond message retention should fail");
+        assert!(inverted.contains("cannot exceed"));
+    }
+
+    #[test]
+    fn observability_defaults_are_safe_and_raw_debug_is_explicit() {
+        let defaults = AppConfig::default().observability;
+        assert_eq!(defaults.level, "info");
+        assert!(defaults.decision_trace);
+        assert!(defaults.llm_metrics);
+        assert!(!defaults.raw_protocol_debug_enabled());
+
+        let enabled = parse_and_validate_config(
+            r#"{"observability":{"level":"debug","raw_protocol_debug":true,"decision_trace":false,"llm_metrics":false}}"#,
+        )
+        .expect("debug diagnostics should be explicit and valid");
+        assert!(enabled.observability.raw_protocol_debug_enabled());
+        assert!(!enabled.observability.decision_trace);
+        assert!(!enabled.observability.llm_metrics);
+
+        let invalid_level = parse_and_validate_config(r#"{"observability":{"level":"verbose"}}"#)
+            .expect_err("unknown observability level should fail");
+        assert!(invalid_level.contains("observability.level"));
+
+        let unsafe_debug = parse_and_validate_config(
+            r#"{"observability":{"level":"info","raw_protocol_debug":true}}"#,
+        )
+        .expect_err("raw protocol output must require debug level");
+        assert!(unsafe_debug.contains("raw_protocol_debug"));
+    }
+
+    #[test]
+    fn sticker_cache_limits_default_safely_and_reject_invalid_ranges() {
+        let defaults = AppConfig::default().stickers;
+        assert!(defaults.cache_media);
+        assert_eq!(defaults.daily_collect_limit, 100);
+        assert_eq!(defaults.cache_max_file_mib, 8);
+        assert_eq!(defaults.cache_max_total_mib, 256);
+        assert_eq!(defaults.cache_timeout_sec, 15);
+        assert_eq!(defaults.daily_send_limit, 30);
+        assert_eq!(defaults.sticker_cooldown_sec, 300);
+        assert_eq!(defaults.max_chain, 2);
+
+        let too_large = parse_and_validate_config(r#"{"stickers":{"cache_max_file_mib":33}}"#)
+            .expect_err("oversized cache file limit should fail");
+        assert!(too_large.contains("cache_max_file_mib"));
+
+        let inverted = parse_and_validate_config(
+            r#"{"stickers":{"cache_max_file_mib":8,"cache_max_total_mib":4}}"#,
+        )
+        .expect_err("cache total below a single file should fail");
+        assert!(inverted.contains("cache_max_total_mib"));
+
+        let invalid_daily_limit =
+            parse_and_validate_config(r#"{"stickers":{"daily_collect_limit":0}}"#)
+                .expect_err("zero daily collection limit should fail");
+        assert!(invalid_daily_limit.contains("daily_collect_limit"));
+
+        let invalid_send_limit =
+            parse_and_validate_config(r#"{"stickers":{"daily_send_limit":0}}"#)
+                .expect_err("zero daily send limit should fail");
+        assert!(invalid_send_limit.contains("daily_send_limit"));
+
+        let invalid_cooldown =
+            parse_and_validate_config(r#"{"stickers":{"sticker_cooldown_sec":86401}}"#)
+                .expect_err("unbounded sticker cooldown should fail");
+        assert!(invalid_cooldown.contains("sticker_cooldown_sec"));
+
+        let invalid_chain = parse_and_validate_config(r#"{"stickers":{"max_chain":4}}"#)
+            .expect_err("sticker chains longer than three should fail");
+        assert!(invalid_chain.contains("max_chain"));
     }
 }

@@ -220,6 +220,12 @@ pub fn record_reply(msg: &InMessage, timestamp: i64) {
 }
 
 pub fn record_coalesced(batch: &CoalescedMessage) {
+    if !crate::pipeline::current_config()
+        .observability
+        .decision_trace
+    {
+        return;
+    }
     let Some(database) = crate::pipeline::try_db() else {
         return;
     };
@@ -257,6 +263,12 @@ pub fn record_coalesced(batch: &CoalescedMessage) {
 }
 
 fn persist_trace(msg: &InMessage, decision: &ReplyDecision, coalesced_count: usize) {
+    if !crate::pipeline::current_config()
+        .observability
+        .decision_trace
+    {
+        return;
+    }
     let Some(database) = crate::pipeline::try_db() else {
         return;
     };

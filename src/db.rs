@@ -37,6 +37,13 @@ pub enum OutboundClaim {
     InFlightOrUncertain,
 }
 
+/// 一次保留期清理的脱敏和删除统计，不含任何用户正文。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    pub raw_events_redacted: usize,
+    pub messages_deleted: usize,
+}
+
 pub struct DecisionTrace<'a> {
     pub event_key: &'a str,
     pub session_id: &'a str,
@@ -106,12 +113,23 @@ impl Database {
         &self,
         msg: &crate::pipeline::InMessage,
     ) -> Result<bool, rusqlite::Error> {
+        let store_raw_events = crate::pipeline::current_config().privacy.store_raw_events;
+        self.insert_message_with_raw_event_storage(msg, store_raw_events)
+    }
+
+    /// 插入消息并按隐私配置决定是否保存已脱敏的原始事件 JSON。
+    pub fn insert_message_with_raw_event_storage(
+        &self,
+        msg: &crate::pipeline::InMessage,
+        store_raw_events: bool,
+    ) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let media_type = msg.media.first().map(|media| media.media_type.as_str());
         let media_url = msg
             .media
             .first()
             .map(|media| crate::media::redact_url_for_storage(&media.url));
+        let raw_json = store_raw_events.then_some(msg.safe_raw_json.as_str());
         let changed = conn.execute(
             "INSERT OR IGNORE INTO messages
              (event_key, protocol, bot_account_id, direction, session_type, session_id, sender_id,
@@ -128,7 +146,7 @@ impl Database {
                 msg.sender_name,
                 msg.message_id,
                 msg.content,
-                msg.safe_raw_json,
+                raw_json,
                 msg.has_media as i32,
                 media_type,
                 media_url,
@@ -138,6 +156,62 @@ impl Database {
             ],
         )?;
         Ok(changed > 0)
+    }
+
+    /// 清理超出保留期的事件详情，且不删除仍被派生数据或审计引用的 journal 行。
+    pub fn apply_retention(
+        &self,
+        store_raw_events: bool,
+        raw_event_retention_days: u32,
+        message_retention_days: u32,
+        now: i64,
+    ) -> Result<RetentionReport, rusqlite::Error> {
+        const MILLIS_PER_DAY: i64 = 86_400_000;
+        let raw_days = i64::from(raw_event_retention_days.clamp(1, 3_650));
+        let message_days = i64::from(message_retention_days.clamp(1, 3_650));
+        let raw_cutoff = now.saturating_sub(raw_days.saturating_mul(MILLIS_PER_DAY));
+        let message_cutoff = now.saturating_sub(message_days.saturating_mul(MILLIS_PER_DAY));
+        let mut connection = self.conn.lock().unwrap();
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let raw_events_redacted = transaction.execute(
+            "UPDATE messages
+             SET raw_json = NULL, updated_at = MAX(COALESCE(updated_at, ?1), ?1)
+             WHERE raw_json IS NOT NULL
+               AND (?2 = 0 OR created_at < ?3)",
+            params![now, i32::from(store_raw_events), raw_cutoff],
+        )?;
+        let messages_deleted = transaction.execute(
+            "DELETE FROM messages AS message
+             WHERE message.direction = 'inbound'
+               AND message.processing_status IN ('processed', 'record_only')
+               AND message.created_at < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM memory_sources AS source
+                   WHERE source.source_type = 'message'
+                     AND source.source_id = message.event_key
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM knowledge_sources AS source
+                   WHERE source.source_type = 'message'
+                     AND source.source_id = message.event_key
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM decision_traces AS trace
+                   WHERE trace.event_key = message.event_key
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM outbound_messages AS outbound
+                   WHERE outbound.source_event_key = message.event_key
+               )",
+            params![message_cutoff],
+        )?;
+        transaction.commit()?;
+
+        Ok(RetentionReport {
+            raw_events_redacted,
+            messages_deleted,
+        })
     }
 
     pub fn set_message_processing_status(

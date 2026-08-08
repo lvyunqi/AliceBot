@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 14;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 16;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -130,6 +130,8 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         12 => migration_12_short_context_recovery_indexes(transaction)?,
         13 => migration_13_behavior_calibration(transaction)?,
         14 => migration_14_media_url_privacy(transaction)?,
+        15 => migration_15_sticker_cache(transaction)?,
+        16 => migration_16_sticker_graph(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -950,6 +952,79 @@ fn migration_14_media_url_privacy(conn: &Connection) -> Result<(), rusqlite::Err
     Ok(())
 }
 
+fn migration_15_sticker_cache(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(conn, "stickers", "cache_path", "TEXT")?;
+    ensure_column(conn, "stickers", "cache_size", "INTEGER")?;
+    ensure_column(conn, "stickers", "cache_error", "TEXT")?;
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sticker_sources (
+            sticker_id   INTEGER NOT NULL,
+            url_hash     TEXT NOT NULL,
+            protocol     TEXT NOT NULL DEFAULT '',
+            source_user  TEXT NOT NULL DEFAULT '',
+            source_session TEXT NOT NULL DEFAULT '',
+            first_seen   INTEGER NOT NULL,
+            last_seen    INTEGER NOT NULL,
+            seen_count   INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (sticker_id, url_hash),
+            FOREIGN KEY (sticker_id) REFERENCES stickers(id) ON DELETE CASCADE
+        );
+
+        INSERT OR IGNORE INTO sticker_sources
+            (sticker_id, url_hash, protocol, source_user, source_session,
+             first_seen, last_seen, seen_count)
+        SELECT id,
+               COALESCE(NULLIF(url_hash, ''), 'legacy-url:' || id),
+               COALESCE(protocol, ''),
+               COALESCE(source_user, ''),
+               COALESCE(source_session, ''),
+               created_at,
+               COALESCE(last_used, created_at),
+               MAX(COALESCE(usage_count, 1), 1)
+        FROM stickers;
+
+        CREATE INDEX IF NOT EXISTS idx_sticker_sources_url_hash_v15
+            ON sticker_sources(url_hash, sticker_id);
+        CREATE INDEX IF NOT EXISTS idx_stickers_file_hash_v15
+            ON stickers(file_hash);
+        CREATE INDEX IF NOT EXISTS idx_stickers_cache_status_v15
+            ON stickers(cache_status, cache_size, updated_at DESC, id);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn migration_16_sticker_graph(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_column(
+        conn,
+        "sticker_links",
+        "edge_kind",
+        "TEXT NOT NULL DEFAULT 'cooccur'",
+    )?;
+    ensure_column(conn, "sticker_links", "weight", "REAL NOT NULL DEFAULT 1")?;
+    ensure_column(
+        conn,
+        "sticker_links",
+        "evidence_count",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    conn.execute_batch(
+        r#"
+        UPDATE sticker_links
+        SET edge_kind = COALESCE(NULLIF(edge_kind, ''), 'cooccur'),
+            weight = MAX(COALESCE(co_count, 1), 0),
+            evidence_count = MAX(COALESCE(co_count, 1), 1);
+
+        CREATE INDEX IF NOT EXISTS idx_sticker_links_a_weight_v16
+            ON sticker_links(sticker_a, weight DESC, updated_at DESC, sticker_b ASC);
+        CREATE INDEX IF NOT EXISTS idx_sticker_links_b_weight_v16
+            ON sticker_links(sticker_b, weight DESC, updated_at DESC, sticker_a ASC);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn sanitize_media_url_column(conn: &Connection, table: &str) -> Result<(), rusqlite::Error> {
     let rows = {
         let mut statement = conn.prepare(&format!(
@@ -1128,12 +1203,38 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "url_hash",
                 "url_requires_cache",
                 "cache_status",
+                "cache_path",
+                "cache_size",
+                "cache_error",
                 "source_session",
                 "updated_at",
             ][..],
         ),
         ("sticker_tags", &["sticker_id", "tag", "weight"][..]),
-        ("sticker_links", &["sticker_a", "sticker_b", "co_count"][..]),
+        (
+            "sticker_links",
+            &[
+                "sticker_a",
+                "sticker_b",
+                "co_count",
+                "edge_kind",
+                "weight",
+                "evidence_count",
+            ][..],
+        ),
+        (
+            "sticker_sources",
+            &[
+                "sticker_id",
+                "url_hash",
+                "protocol",
+                "source_user",
+                "source_session",
+                "first_seen",
+                "last_seen",
+                "seen_count",
+            ][..],
+        ),
         (
             "reflection_log",
             &["triggered_by", "insights", "created_at"][..],
@@ -1191,6 +1292,9 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_reflection_changes_status_time_v13",
         "idx_stickers_url_hash_v14",
         "idx_stickers_delivery_v14",
+        "idx_sticker_sources_url_hash_v15",
+        "idx_stickers_file_hash_v15",
+        "idx_stickers_cache_status_v15",
         "ux_knowledge_key_version",
         "idx_persona_subject_protocol",
         "idx_persona_observation_subject",
@@ -1916,6 +2020,115 @@ mod tests {
             })
             .unwrap();
         assert!(raw_url.contains("rkey=secret"));
+    }
+
+    #[test]
+    fn version_fourteen_database_gains_sticker_cache_metadata_and_sources() {
+        let temporary = TempDatabase::new("version-fourteen");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 14).unwrap();
+        connection
+            .execute(
+                "INSERT INTO stickers
+                 (protocol, media_url, url_hash, url_requires_cache, cache_status,
+                  source_user, source_session, usage_count, last_used, created_at, updated_at)
+                 VALUES ('onebot11', 'https://example.test/image.png', 'stable-url-hash', 0,
+                         'remote', 'user-1', 'session-1', 3, 2, 1, 2)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version fourteen should migrate");
+        let connection = database.conn.lock().unwrap();
+        for column in ["cache_path", "cache_size", "cache_error"] {
+            assert!(column_exists(&connection, "stickers", column).unwrap());
+        }
+        assert!(object_exists(&connection, "table", "sticker_sources").unwrap());
+        for index in [
+            "idx_sticker_sources_url_hash_v15",
+            "idx_stickers_file_hash_v15",
+            "idx_stickers_cache_status_v15",
+        ] {
+            assert!(object_exists(&connection, "index", index).unwrap());
+        }
+        let source: (String, String, String, i64, i64, i64) = connection
+            .query_row(
+                "SELECT url_hash, protocol, source_user, first_seen, last_seen, seen_count
+                 FROM sticker_sources",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            source,
+            (
+                "stable-url-hash".to_string(),
+                "onebot11".to_string(),
+                "user-1".to_string(),
+                1,
+                2,
+                3,
+            )
+        );
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 14);
+        assert!(!object_exists(&backup, "table", "sticker_sources").unwrap());
+        assert!(!column_exists(&backup, "stickers", "cache_path").unwrap());
+    }
+
+    #[test]
+    fn version_fifteen_database_gains_weighted_sticker_links() {
+        let temporary = TempDatabase::new("version-fifteen");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 15).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sticker_links (sticker_a, sticker_b, co_count, updated_at)
+                 VALUES (1, 2, 4, 100)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version fifteen should migrate");
+        let connection = database.conn.lock().unwrap();
+        for column in ["edge_kind", "weight", "evidence_count"] {
+            assert!(column_exists(&connection, "sticker_links", column).unwrap());
+        }
+        let edge: (String, f64, i64) = connection
+            .query_row(
+                "SELECT edge_kind, weight, evidence_count
+                 FROM sticker_links WHERE sticker_a = 1 AND sticker_b = 2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(edge.0, "cooccur");
+        assert_eq!(edge.1, 4.0);
+        assert_eq!(edge.2, 4);
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 15);
+        assert!(!column_exists(&backup, "sticker_links", "weight").unwrap());
     }
 
     #[test]

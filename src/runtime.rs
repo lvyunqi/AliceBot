@@ -12,11 +12,14 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::config::AppConfig;
 use crate::pipeline::{DirectAskTask, InMessage};
+use crate::stickers::cache::CacheTask;
 
 const MESSAGE_QUEUE_CAPACITY: usize = 1024;
 const MESSAGE_CONCURRENCY: usize = 32;
 const DIRECT_ASK_QUEUE_CAPACITY: usize = 32;
 const DIRECT_ASK_CONCURRENCY: usize = 4;
+const STICKER_CACHE_QUEUE_CAPACITY: usize = 32;
+const STICKER_CACHE_CONCURRENCY: usize = 2;
 
 struct RuntimeState {
     runtime: Option<Runtime>,
@@ -25,6 +28,7 @@ struct RuntimeState {
     background_tasks: Vec<JoinHandle<()>>,
     message_sender: Option<mpsc::Sender<InMessage>>,
     direct_ask_sender: Option<mpsc::Sender<DirectAskTask>>,
+    sticker_cache_sender: Option<mpsc::Sender<CacheTask>>,
 }
 
 /// 可重复启动和关闭的插件 runtime。
@@ -42,6 +46,7 @@ impl PluginRuntime {
                 background_tasks: Vec::new(),
                 message_sender: None,
                 direct_ask_sender: None,
+                sticker_cache_sender: None,
             }),
         }
     }
@@ -69,10 +74,18 @@ impl PluginRuntime {
                 state.shutdown.clone(),
                 state.stop_notify.clone(),
             ));
+            let (sticker_cache_sender, sticker_cache_receiver) =
+                mpsc::channel(STICKER_CACHE_QUEUE_CAPACITY);
+            let sticker_cache_worker = runtime.handle().spawn(sticker_cache_dispatcher(
+                sticker_cache_receiver,
+                state.shutdown.clone(),
+                state.stop_notify.clone(),
+            ));
             state.runtime = Some(runtime);
-            state.background_tasks = vec![message_worker, direct_ask_worker];
+            state.background_tasks = vec![message_worker, direct_ask_worker, sticker_cache_worker];
             state.message_sender = Some(sender);
             state.direct_ask_sender = Some(direct_ask_sender);
+            state.sticker_cache_sender = Some(sticker_cache_sender);
         } else {
             state.shutdown.store(false, Ordering::Release);
         }
@@ -118,6 +131,19 @@ impl PluginRuntime {
             return DirectAskSubmitResult::Unavailable;
         };
         try_submit_direct_ask(sender, task)
+    }
+
+    /// Queue a bounded asynchronous media cache job outside the reply path.
+    pub(crate) fn submit_sticker_cache(&self, task: CacheTask) -> StickerCacheSubmitResult {
+        let sender = match self.state.lock() {
+            Ok(state) => state.sticker_cache_sender.clone(),
+            Err(_) => None,
+        };
+        let Some(sender) = sender else {
+            task.reset_for_retry("runtime_unavailable");
+            return StickerCacheSubmitResult::Unavailable;
+        };
+        try_submit_sticker_cache(&sender, task)
     }
 
     /// 启动后台任务（压缩、反思等）。
@@ -167,6 +193,19 @@ impl PluginRuntime {
                     }
                 };
                 if compaction_succeeded {
+                    match crate::memory::retention::run(&config.privacy) {
+                        Ok(report)
+                            if report.raw_events_redacted > 0 || report.messages_deleted > 0 =>
+                        {
+                            log::info!(
+                                "[AliceBot] privacy retention completed: raw_events_redacted={}, messages_deleted={}",
+                                report.raw_events_redacted,
+                                report.messages_deleted
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => log::warn!("[AliceBot] privacy retention failed: {error}"),
+                    }
                     match crate::memory::reflection::run_if_due(&config).await {
                         Ok(report) => {
                             if matches!(
@@ -199,24 +238,33 @@ impl PluginRuntime {
 
     /// 停止后台任务并销毁 runtime，保证动态库卸载前不再执行插件代码。
     pub fn shutdown(&self) {
-        let (runtime, tasks, shutdown, stop_notify, message_sender, direct_ask_sender) =
-            match self.state.lock() {
-                Ok(mut state) => {
-                    state.shutdown.store(true, Ordering::Release);
-                    (
-                        state.runtime.take(),
-                        std::mem::take(&mut state.background_tasks),
-                        state.shutdown.clone(),
-                        state.stop_notify.clone(),
-                        state.message_sender.take(),
-                        state.direct_ask_sender.take(),
-                    )
-                }
-                Err(_) => return,
-            };
+        let (
+            runtime,
+            tasks,
+            shutdown,
+            stop_notify,
+            message_sender,
+            direct_ask_sender,
+            sticker_cache_sender,
+        ) = match self.state.lock() {
+            Ok(mut state) => {
+                state.shutdown.store(true, Ordering::Release);
+                (
+                    state.runtime.take(),
+                    std::mem::take(&mut state.background_tasks),
+                    state.shutdown.clone(),
+                    state.stop_notify.clone(),
+                    state.message_sender.take(),
+                    state.direct_ask_sender.take(),
+                    state.sticker_cache_sender.take(),
+                )
+            }
+            Err(_) => return,
+        };
 
         drop(message_sender);
         drop(direct_ask_sender);
+        drop(sticker_cache_sender);
         shutdown.store(true, Ordering::Release);
         stop_notify.notify_waiters();
         let Some(runtime) = runtime else {
@@ -247,6 +295,14 @@ pub enum DirectAskSubmitResult {
     Unavailable,
 }
 
+/// Cache queue result. A rejected job is reset to a retryable URL-only state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StickerCacheSubmitResult {
+    Enqueued,
+    Full,
+    Unavailable,
+}
+
 fn try_submit_message(sender: &mpsc::Sender<InMessage>, message: InMessage) -> MessageSubmitResult {
     match sender.try_send(message) {
         Ok(()) => MessageSubmitResult::Enqueued,
@@ -263,6 +319,23 @@ fn try_submit_direct_ask(
         Ok(()) => DirectAskSubmitResult::Enqueued,
         Err(mpsc::error::TrySendError::Full(_)) => DirectAskSubmitResult::Full,
         Err(mpsc::error::TrySendError::Closed(_)) => DirectAskSubmitResult::Unavailable,
+    }
+}
+
+fn try_submit_sticker_cache(
+    sender: &mpsc::Sender<CacheTask>,
+    task: CacheTask,
+) -> StickerCacheSubmitResult {
+    match sender.try_send(task) {
+        Ok(()) => StickerCacheSubmitResult::Enqueued,
+        Err(mpsc::error::TrySendError::Full(task)) => {
+            task.reset_for_retry("queue_full");
+            StickerCacheSubmitResult::Full
+        }
+        Err(mpsc::error::TrySendError::Closed(task)) => {
+            task.reset_for_retry("runtime_unavailable");
+            StickerCacheSubmitResult::Unavailable
+        }
     }
 }
 
@@ -363,9 +436,61 @@ async fn direct_ask_dispatcher(
     }
 }
 
+/// Bounded cache worker. Shutdown returns queued rows to their retryable URL-only state.
+async fn sticker_cache_dispatcher(
+    mut receiver: mpsc::Receiver<CacheTask>,
+    shutdown: Arc<AtomicBool>,
+    stop_notify: Arc<Notify>,
+) {
+    let permits = Arc::new(Semaphore::new(STICKER_CACHE_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+
+    loop {
+        while tasks.try_join_next().is_some() {}
+        let permit = tokio::select! {
+            _ = stop_notify.notified() => break,
+            permit = permits.clone().acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
+        };
+        let next_task = tokio::select! {
+            _ = stop_notify.notified() => break,
+            task = receiver.recv() => task,
+        };
+        let Some(task) = next_task else {
+            break;
+        };
+
+        let task_shutdown = shutdown.clone();
+        let task_notify = stop_notify.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            if task_shutdown.load(Ordering::Acquire) {
+                task.reset_for_retry("shutdown");
+                return;
+            }
+            tokio::select! {
+                _ = task_notify.notified() => task.reset_for_retry("shutdown"),
+                _ = crate::stickers::cache::process(&task) => {}
+            }
+        });
+    }
+
+    while let Ok(task) = receiver.try_recv() {
+        task.reset_for_retry("shutdown");
+    }
+    while let Some(result) = tasks.join_next().await {
+        if let Err(error) = result {
+            log::debug!("[AliceBot] sticker cache worker stopped: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stickers::cache::CachePolicy;
 
     #[test]
     fn runtime_can_restart_after_shutdown() {
@@ -406,6 +531,83 @@ mod tests {
             try_submit_direct_ask(&sender, task),
             DirectAskSubmitResult::Full
         );
+    }
+
+    #[test]
+    fn full_sticker_cache_queue_restores_a_retryable_row() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let (_first_database, first_task) = queued_cache_task();
+        let (second_database, second_task) = queued_cache_task();
+        assert_eq!(
+            try_submit_sticker_cache(&sender, first_task),
+            StickerCacheSubmitResult::Enqueued
+        );
+        assert_eq!(
+            try_submit_sticker_cache(&sender, second_task),
+            StickerCacheSubmitResult::Full
+        );
+        assert_cache_retry_state(&second_database, "queue_full");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_sticker_cache_dispatcher_restores_queued_rows() {
+        let (database, task) = queued_cache_task();
+        let (sender, receiver) = mpsc::channel(1);
+        sender.send(task).await.unwrap();
+        drop(sender);
+
+        sticker_cache_dispatcher(
+            receiver,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(Notify::new()),
+        )
+        .await;
+
+        assert_cache_retry_state(&database, "shutdown");
+    }
+
+    fn queued_cache_task() -> (Arc<crate::db::Database>, CacheTask) {
+        let database = Arc::new(crate::db::Database::open(":memory:").unwrap());
+        let sticker_id = {
+            let connection = database.conn.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO stickers
+                     (protocol, media_url, url_hash, url_requires_cache, cache_status,
+                      usage_count, created_at, updated_at)
+                     VALUES ('onebot11', 'https://example.test/image.png', 'url-hash', 0,
+                             'queued', 1, 1, 1)",
+                    [],
+                )
+                .unwrap();
+            connection.last_insert_rowid()
+        };
+        let task = CacheTask::new(
+            database.clone(),
+            sticker_id,
+            "https://example.test/image.png".to_string(),
+            std::env::temp_dir().join("alicebot-runtime-cache-test"),
+            CachePolicy {
+                max_file_bytes: 1_024,
+                max_total_bytes: 4_096,
+                timeout_sec: 1,
+            },
+        );
+        (database, task)
+    }
+
+    fn assert_cache_retry_state(database: &crate::db::Database, expected_error: &str) {
+        let state: (String, String) = database
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT cache_status, cache_error FROM stickers",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("remote".to_string(), expected_error.to_string()));
     }
 
     fn test_direct_ask() -> DirectAskTask {

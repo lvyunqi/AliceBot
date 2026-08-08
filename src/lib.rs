@@ -72,7 +72,7 @@ fn accept_inbound_message(req: &InterceptorRequest) {
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 3,
+    config_version = 9,
     config_apply = "reload"
 )]
 mod plugin {
@@ -100,10 +100,13 @@ mod plugin {
             return PluginInitResult::err(&format!("runtime 启动失败: {e}"));
         }
 
-        pipeline::set_config(cfg.clone());
+        let data_dir = config.data_dir.as_str();
+        pipeline::set_config(
+            cfg.clone(),
+            std::path::PathBuf::from(data_dir).join("stickers"),
+        );
 
         // 初始化数据库
-        let data_dir = config.data_dir.as_str();
         let db_path = format!("{}/alicebot.db", data_dir);
         match rt.block_on(db::init_database(&db_path)) {
             Ok(db) => {
@@ -202,7 +205,8 @@ mod plugin {
         name = "forget",
         description = "让 AliceBot 忘记某件事",
         aliases = "忘记",
-        category = "ai"
+        category = "ai",
+        scope = "private"
     )]
     fn cmd_forget(req: &CommandRequest) -> CommandResponse {
         pipeline::suppress_autonomous_reply_for_command(req);
@@ -210,9 +214,15 @@ mod plugin {
         if text.is_empty() {
             return CommandResponse::text("想让我忘记什么呀？说个关键词～");
         }
-        // 委托给 runtime 异步处理
+        let message = pipeline::normalize_command_message(req, text);
+        if message.session_type != "private" {
+            return CommandResponse::text("为了避免误删共享记忆，请私聊我使用这个命令～");
+        }
+        // 委托给 runtime 执行短事务，命令回调不访问模型网络。
         let rt = &*RUNTIME;
-        let result = rt.block_on(async { memory::forget_by_keyword(text).await });
+        let result = rt.block_on(async {
+            memory::forget_by_keyword(&message.protocol, &message.sender_id, text).await
+        });
         CommandResponse::text(&result)
     }
 
@@ -220,7 +230,8 @@ mod plugin {
         name = "status",
         description = "查看 AliceBot 状态",
         aliases = "状态,stats",
-        category = "tools"
+        category = "tools",
+        role = "admin"
     )]
     fn cmd_status(req: &CommandRequest) -> CommandResponse {
         pipeline::suppress_autonomous_reply_for_command(req);
@@ -239,5 +250,31 @@ mod plugin {
             Ok(_) => abi_stable_host_api::PluginConfigResult::ok(),
             Err(error) => abi_stable_host_api::PluginConfigResult::err(&error),
         }
+    }
+}
+
+#[cfg(test)]
+mod plugin_contract_tests {
+    #[test]
+    #[allow(unsafe_code)]
+    fn command_descriptor_limits_status_to_administrators() {
+        // The macro emits this C ABI symbol; inspect the generated descriptor rather than
+        // duplicating its authorization metadata in a separate Rust constant.
+        let descriptor = unsafe { super::qimen_plugin_descriptor() };
+        let status = descriptor
+            .commands
+            .iter()
+            .find(|command| command.name.as_str() == "status")
+            .expect("status command should be registered");
+        assert_eq!(status.required_role.as_str(), "admin");
+        assert!(status.scope.as_str().is_empty());
+
+        let forget = descriptor
+            .commands
+            .iter()
+            .find(|command| command.name.as_str() == "forget")
+            .expect("forget command should be registered");
+        assert!(forget.required_role.as_str().is_empty());
+        assert_eq!(forget.scope.as_str(), "private");
     }
 }

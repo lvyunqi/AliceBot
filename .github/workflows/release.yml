@@ -1,0 +1,150 @@
+name: Release AliceBot Plugin
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  PLUGIN_ID: alicebot
+  SOURCE_LIB_STEM: alicebot
+  ASSET_LIB_STEM: qimen_dynamic_plugin_alicebot
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          components: rustfmt, clippy
+      - name: Check plugin identity
+        shell: bash
+        run: |
+          expected="qimen_dynamic_plugin_${PLUGIN_ID//-/_}"
+          test "$ASSET_LIB_STEM" = "$expected" || {
+            echo "ASSET_LIB_STEM must be $expected" >&2
+            exit 1
+          }
+          test "$SOURCE_LIB_STEM" = "alicebot" || {
+            echo "SOURCE_LIB_STEM must match Cargo's cdylib name" >&2
+            exit 1
+          }
+      - run: cargo +1.89.0 fmt --check
+      - run: cargo +1.89.0 check --locked
+      - run: cargo +1.89.0 test --locked
+      - run: cargo +1.89.0 clippy --locked --all-targets
+
+  linux-x64-gnu:
+    needs: verify
+    runs-on: ubuntu-22.04
+    # Debian 11 fixes the marketplace GNU/Linux glibc baseline at 2.31.
+    container: rust:1.89-bullseye
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ELF inspection tools
+        shell: bash
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends binutils file
+      - name: Build ${{ env.TARGET }}
+        shell: bash
+        run: |
+          rustup target add "$TARGET"
+          cargo +1.89.0 build --locked --release --target "$TARGET"
+      - name: Prepare marketplace asset
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          source="target/${TARGET}/release/lib${SOURCE_LIB_STEM}.so"
+          asset="release-assets/lib${ASSET_LIB_STEM}-${TARGET}.so"
+          test -f "$source"
+          cp "$source" "$asset"
+          sha256sum "$asset" > "${asset}.sha256"
+          size_bytes="$(stat --format=%s "$asset")"
+          sha256="$(sha256sum "$asset" | awk '{print $1}')"
+          generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          printf '{\n  "plugin_id": "%s",\n  "target": "%s",\n  "asset_name": "%s",\n  "size_bytes": %s,\n  "sha256": "%s",\n  "generated_at_utc": "%s"\n}\n' \
+            "$PLUGIN_ID" "$TARGET" "$(basename "$asset")" "$size_bytes" "$sha256" "$generated_at" > "${asset}.manifest.json"
+      - name: Inspect ELF and glibc baseline
+        shell: bash
+        run: |
+          asset="release-assets/lib${ASSET_LIB_STEM}-${TARGET}.so"
+          file "$asset"
+          ldd "$asset"
+          readelf --version-info "$asset"
+          min_glibc="$(readelf --version-info "$asset" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -V | tail -n 1)"
+          test -n "$min_glibc"
+          test "$(printf '%s\n%s\n' "$min_glibc" '2.31' | sort -V | head -n 1)" = "$min_glibc" || {
+            echo "artifact requires glibc $min_glibc, above Debian 11 baseline" >&2
+            exit 1
+          }
+          printf 'min_glibc=%s\n' "$min_glibc" | tee "${asset}.glibc"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alicebot-${{ env.TARGET }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  windows-x64:
+    needs: verify
+    runs-on: windows-2022
+    env:
+      TARGET: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89.0"
+          targets: x86_64-pc-windows-msvc
+      - name: Build ${{ env.TARGET }}
+        shell: pwsh
+        run: cargo +1.89.0 build --locked --release --target $env:TARGET
+      - name: Prepare marketplace asset
+        shell: pwsh
+        run: |
+          .\scripts\package-release.ps1 -Target $env:TARGET -InputPath "target\$env:TARGET\release\alicebot.dll" -OutputDirectory release-assets
+          $asset = Get-Item -LiteralPath "release-assets\$env:ASSET_LIB_STEM-$env:TARGET.dll"
+          $sha256 = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha256  $($asset.Name)" | Set-Content -LiteralPath "$($asset.FullName).sha256" -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alicebot-${{ env.TARGET }}
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux-x64-gnu, windows-x64]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: alicebot-*
+          path: release-assets
+          merge-multiple: true
+      - name: List release assets
+        shell: bash
+        run: find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+      - name: Generate build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release-assets/*.dll
+            release-assets/*.so
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
