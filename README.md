@@ -2,6 +2,12 @@
 
 AliceBot 是一个 QimenBot 动态插件，提供自主对话、异步 `/ask` 命令、按作用域隔离的记忆，以及隐私感知的贴纸收集。它以 Rust `cdylib` 形式分发，使用 QimenBot 动态 ABI API `0.6`。
 
+## 默认表达
+
+默认回复以一两句自然短句为主，先回答问题，不使用客服腔、刻意卖萌、连续语气词或无关的情绪铺垫。Emoji 默认目标频率为 `0.1`，只在确有语义需要时使用。`persona.speaking_style` 只影响用词，不能覆盖这些基础表达规则。
+
+已经保存的插件配置不会自动改写；若旧配置仍设置了较高的 `behavior.emoji_usage` 或 `behavior.allow_typos = true`，可在配置页将其调整为 `0.1` 和 `false`。
+
 ## 兼容性
 
 - QimenBot `v0.1.18` 或更高版本。

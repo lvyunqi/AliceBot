@@ -46,7 +46,7 @@
           "type": "string",
           "title": "说话风格",
           "description": "口语化风格描述",
-          "default": "口语化，爱用表情词，偶尔打错字，讨厌一本正经"
+          "default": "简短口语化，直接回答，不堆表情或语气词"
         }
       },
       "required": ["name"]
@@ -193,17 +193,17 @@
         },
         "allow_typos": {
           "type": "boolean",
-          "title": "允许语句错误",
-          "description": "允许回复中偶尔出现口语化错误，更拟人",
-          "default": true
+          "title": "允许口语省略",
+          "description": "允许少量自然口语省略；不会故意使用错别字或装笨",
+          "default": false
         },
         "emoji_usage": {
           "type": "number",
-          "title": "Emoji 使用概率",
-          "description": "回复中带 emoji 的概率 0-1",
+          "title": "Emoji 使用频率",
+          "description": "回复中使用 emoji 的目标频率 0-1；默认克制使用",
           "minimum": 0,
           "maximum": 1,
-          "default": 0.6
+          "default": 0.1
         }
       }
     },

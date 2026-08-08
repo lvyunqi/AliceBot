@@ -119,7 +119,7 @@ impl Default for PersonaConfig {
             age: 22,
             personality: "俏皮、有点毒舌、好奇心强".into(),
             background: "一个喜欢猫和咖啡的二次元少女".into(),
-            speaking_style: "口语化，爱用表情词".into(),
+            speaking_style: "简短口语化，直接回答，不堆表情或语气词".into(),
         }
     }
 }
@@ -252,7 +252,7 @@ pub struct BehaviorConfig {
     #[serde(default = "default_min_interval")]
     pub min_interval_sec: u64,
 
-    #[serde(default)]
+    #[serde(default = "default_allow_typos")]
     pub allow_typos: bool,
 
     #[serde(default = "default_emoji_usage")]
@@ -274,8 +274,11 @@ fn default_max_context() -> u32 {
 fn default_min_interval() -> u64 {
     15
 }
+fn default_allow_typos() -> bool {
+    false
+}
 fn default_emoji_usage() -> f32 {
-    0.6
+    0.1
 }
 
 impl Default for BehaviorConfig {
@@ -286,7 +289,7 @@ impl Default for BehaviorConfig {
             max_tokens: default_max_tokens(),
             max_context_tokens: default_max_context(),
             min_interval_sec: default_min_interval(),
-            allow_typos: true,
+            allow_typos: default_allow_typos(),
             emoji_usage: default_emoji_usage(),
         }
     }
@@ -893,6 +896,37 @@ mod tests {
         let config = parse_and_validate_config(r#"{"decision":{"reply_judge_enabled":true}}"#)
             .expect("reply judge configuration should be valid");
         assert!(config.decision.reply_judge_enabled);
+    }
+
+    #[test]
+    fn concise_chat_defaults_match_the_configuration_schema() {
+        let defaults = AppConfig::default();
+        assert_eq!(
+            defaults.persona.speaking_style,
+            "简短口语化，直接回答，不堆表情或语气词"
+        );
+        assert!(!defaults.behavior.allow_typos);
+        assert_eq!(defaults.behavior.emoji_usage, 0.1);
+
+        let parsed = parse_and_validate_config("{}")
+            .expect("an empty configuration should use concise chat defaults");
+        assert!(!parsed.behavior.allow_typos);
+        assert_eq!(parsed.behavior.emoji_usage, 0.1);
+
+        let schema: serde_json::Value = serde_json::from_str(include_str!("../config.schema.json"))
+            .expect("configuration schema should be valid JSON");
+        assert_eq!(
+            schema["properties"]["persona"]["properties"]["speaking_style"]["default"],
+            "简短口语化，直接回答，不堆表情或语气词"
+        );
+        assert_eq!(
+            schema["properties"]["behavior"]["properties"]["allow_typos"]["default"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["behavior"]["properties"]["emoji_usage"]["default"],
+            0.1
+        );
     }
 
     #[test]
