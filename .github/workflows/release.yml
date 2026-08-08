@@ -166,7 +166,9 @@ jobs:
             test -s "release-assets/$asset"
             test -s "release-assets/$asset.sha256"
           done
-          (cd release-assets && sha256sum -c *.sha256)
+          for checksum in release-assets/*.sha256; do
+            (cd release-assets && sha256sum -c "$(basename "$checksum")")
+          done
       - name: Generate build provenance
         uses: actions/attest-build-provenance@v2
         with:
