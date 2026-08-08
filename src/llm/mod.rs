@@ -30,6 +30,9 @@ impl Role {
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    /// HTTPS image URLs that should be sent as multimodal content blocks.
+    /// URLs are never included in Debug output or persisted in LLM audits.
+    pub image_urls: Vec<String>,
 }
 
 impl fmt::Debug for ChatMessage {
@@ -38,6 +41,7 @@ impl fmt::Debug for ChatMessage {
             .debug_struct("ChatMessage")
             .field("role", &self.role)
             .field("content_chars", &self.content.chars().count())
+            .field("image_count", &self.image_urls.len())
             .finish()
     }
 }
@@ -47,6 +51,7 @@ impl ChatMessage {
         Self {
             role: Role::System,
             content: content.into(),
+            image_urls: Vec::new(),
         }
     }
 
@@ -54,6 +59,7 @@ impl ChatMessage {
         Self {
             role: Role::User,
             content: content.into(),
+            image_urls: Vec::new(),
         }
     }
 
@@ -61,7 +67,26 @@ impl ChatMessage {
         Self {
             role: Role::Assistant,
             content: content.into(),
+            image_urls: Vec::new(),
         }
+    }
+
+    pub fn with_image_urls(mut self, image_urls: impl IntoIterator<Item = String>) -> Self {
+        self.image_urls = image_urls
+            .into_iter()
+            .filter(|url| url.starts_with("https://"))
+            .take(4)
+            .collect();
+        self
+    }
+
+    pub fn has_images(&self) -> bool {
+        !self.image_urls.is_empty()
+    }
+
+    pub fn without_images(mut self) -> Self {
+        self.image_urls.clear();
+        self
     }
 }
 
@@ -184,6 +209,8 @@ struct ProviderClient {
     id: String,
     protocol: String,
     model: String,
+    supports_vision: bool,
+    vision_model: Option<String>,
     client: Box<dyn Llm>,
 }
 
@@ -209,6 +236,11 @@ impl LlmClient {
                             id: provider.id.clone(),
                             protocol: provider.protocol.clone(),
                             model: provider.model.clone(),
+                            supports_vision: provider.supports_vision,
+                            vision_model: provider
+                                .vision_model
+                                .clone()
+                                .filter(|model| !model.trim().is_empty()),
                             client: create_client(
                                 &provider.protocol,
                                 &provider.base_url,
@@ -252,7 +284,23 @@ impl LlmClient {
             loop {
                 let mut provider_request = request.clone();
                 if provider_request.model.trim().is_empty() {
-                    provider_request.model = provider.model.clone();
+                    provider_request.model = if provider_request_has_images(&provider_request)
+                        && provider.supports_vision
+                    {
+                        provider
+                            .vision_model
+                            .clone()
+                            .unwrap_or_else(|| provider.model.clone())
+                    } else {
+                        provider.model.clone()
+                    };
+                }
+                if provider_request_has_images(&provider_request) && !provider.supports_vision {
+                    provider_request.messages = provider_request
+                        .messages
+                        .into_iter()
+                        .map(ChatMessage::without_images)
+                        .collect();
                 }
                 let audit_id = begin_audit(
                     task,
@@ -318,6 +366,10 @@ fn input_chars(request: &ChatRequest) -> usize {
             .iter()
             .map(|message| message.content.chars().count())
             .sum::<usize>()
+}
+
+fn provider_request_has_images(request: &ChatRequest) -> bool {
+    request.messages.iter().any(ChatMessage::has_images)
 }
 
 fn begin_audit(
@@ -470,6 +522,8 @@ mod tests {
                 id: "mock".to_string(),
                 protocol: "test".to_string(),
                 model: "model".to_string(),
+                supports_vision: false,
+                vision_model: None,
                 client: Box::new(mock),
             }],
             retry_limit: 1,
@@ -482,5 +536,99 @@ mod tests {
             max_tokens: 10,
         };
         assert_eq!(client.chat(&request).await.unwrap().text, "ok");
+    }
+
+    struct CaptureMock {
+        request: std::sync::Arc<std::sync::Mutex<Option<ChatRequest>>>,
+    }
+
+    #[async_trait]
+    impl Llm for CaptureMock {
+        async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
+            *self.request.lock().expect("capture lock should work") = Some(req.clone());
+            Ok(ChatResponse {
+                text: "ok".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_provider_uses_override_model_and_keeps_images() {
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let client = LlmClient {
+            providers: vec![ProviderClient {
+                id: "vision".to_string(),
+                protocol: "test".to_string(),
+                model: "text-model".to_string(),
+                supports_vision: true,
+                vision_model: Some("vision-model".to_string()),
+                client: Box::new(CaptureMock {
+                    request: capture.clone(),
+                }),
+            }],
+            retry_limit: 0,
+        };
+        let request = ChatRequest {
+            model: String::new(),
+            system: None,
+            messages: vec![
+                ChatMessage::user("describe")
+                    .with_image_urls(vec!["https://example.test/image.png".to_string()]),
+            ],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+
+        client
+            .chat(&request)
+            .await
+            .expect("vision request should work");
+        let captured = capture
+            .lock()
+            .expect("capture lock should work")
+            .clone()
+            .expect("provider should receive a request");
+        assert_eq!(captured.model, "vision-model");
+        assert_eq!(captured.messages[0].image_urls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn text_provider_receives_a_safe_text_only_fallback() {
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let client = LlmClient {
+            providers: vec![ProviderClient {
+                id: "text".to_string(),
+                protocol: "test".to_string(),
+                model: "text-model".to_string(),
+                supports_vision: false,
+                vision_model: None,
+                client: Box::new(CaptureMock {
+                    request: capture.clone(),
+                }),
+            }],
+            retry_limit: 0,
+        };
+        let request = ChatRequest {
+            model: String::new(),
+            system: None,
+            messages: vec![
+                ChatMessage::user("describe")
+                    .with_image_urls(vec!["https://example.test/image.png".to_string()]),
+            ],
+            temperature: 0.0,
+            max_tokens: 16,
+        };
+
+        client
+            .chat(&request)
+            .await
+            .expect("fallback request should work");
+        let captured = capture
+            .lock()
+            .expect("capture lock should work")
+            .clone()
+            .expect("provider should receive a request");
+        assert_eq!(captured.model, "text-model");
+        assert!(captured.messages[0].image_urls.is_empty());
     }
 }

@@ -34,7 +34,7 @@ impl Llm for OpenAiClient {
             .map(|message| {
                 serde_json::json!({
                     "role": message.role.as_str(),
-                    "content": message.content,
+                    "content": content_value(message),
                 })
             })
             .collect();
@@ -89,6 +89,27 @@ impl Llm for OpenAiClient {
             .to_string();
         Ok(ChatResponse { text })
     }
+}
+
+fn content_value(message: &ChatMessage) -> serde_json::Value {
+    if message.image_urls.is_empty() {
+        return serde_json::json!(message.content);
+    }
+
+    let mut parts = Vec::with_capacity(message.image_urls.len() + 1);
+    if !message.content.trim().is_empty() {
+        parts.push(serde_json::json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+    parts.extend(message.image_urls.iter().map(|url| {
+        serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": url},
+        })
+    }));
+    serde_json::Value::Array(parts)
 }
 
 fn status_error_kind(status: u16) -> ErrorKind {
@@ -163,6 +184,39 @@ mod tests {
         assert!(!format!("{error:?}").contains("raw-body-secret"));
         assert!(!error.message.contains("prompt-secret"));
         assert!(!error.message.contains("api-key-secret"));
+    }
+
+    #[tokio::test]
+    async fn serializes_openai_vision_content_blocks() {
+        let (base_url, server) =
+            spawn_json_server(200, r#"{"choices":[{"message":{"content":"cat"}}]}"#);
+        let client = OpenAiClient::new(&base_url, "test-key", Duration::from_secs(5));
+        let request = ChatRequest {
+            model: "vision-model".to_string(),
+            system: None,
+            messages: vec![
+                ChatMessage::user("describe this")
+                    .with_image_urls(vec!["https://example.test/cat.png".to_string()]),
+            ],
+            temperature: 0.2,
+            max_tokens: 32,
+        };
+
+        client
+            .chat(&request)
+            .await
+            .expect("mock response should parse");
+        let raw_request = server.join().expect("mock server should finish");
+        let (_, body) = raw_request
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request should be JSON");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            "https://example.test/cat.png"
+        );
     }
 
     #[tokio::test]

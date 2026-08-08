@@ -68,11 +68,11 @@ fn accept_inbound_message(req: &InterceptorRequest) {
 
 #[dynamic_plugin(
     id = "alicebot",
-    version = "0.1.0",
+    version = "0.2.0",
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",
-    config_version = 9,
+    config_version = 10,
     config_apply = "reload"
 )]
 mod plugin {
@@ -202,6 +202,29 @@ mod plugin {
     }
 
     #[command(
+        name = "sticker",
+        description = "发送一个已收藏的表情包",
+        aliases = "表情包,发图",
+        category = "ai"
+    )]
+    fn cmd_sticker(req: &CommandRequest) -> CommandResponse {
+        pipeline::suppress_autonomous_reply_for_command(req);
+        let keyword = req.args.as_str().trim();
+        let message = pipeline::normalize_command_message(
+            req,
+            if keyword.is_empty() { "image" } else { keyword },
+        );
+        let result = RUNTIME.block_on(async {
+            pipeline::execute_sticker_request(
+                &message,
+                if keyword.is_empty() { "image" } else { keyword },
+            )
+            .await
+        });
+        CommandResponse::text(result.user_message())
+    }
+
+    #[command(
         name = "forget",
         description = "让 AliceBot 忘记某件事",
         aliases = "忘记",
@@ -276,5 +299,12 @@ mod plugin_contract_tests {
             .expect("forget command should be registered");
         assert!(forget.required_role.as_str().is_empty());
         assert_eq!(forget.scope.as_str(), "private");
+
+        assert!(
+            descriptor
+                .commands
+                .iter()
+                .any(|command| command.name.as_str() == "sticker")
+        );
     }
 }

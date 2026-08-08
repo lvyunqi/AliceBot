@@ -118,6 +118,18 @@
                 "description": "模型名称，如 gpt-4o-mini, claude-sonnet-4-5",
                 "default": "gpt-4o-mini"
               },
+              "supports_vision": {
+                "type": "boolean",
+                "title": "支持识图",
+                "description": "仅在所选模型可接收图片内容块时开启；关闭时图片不会发送给该 provider。",
+                "default": false
+              },
+              "vision_model": {
+                "type": "string",
+                "title": "识图模型",
+                "description": "可选。当前消息含图片时使用此模型；留空则继续使用普通模型。",
+                "minLength": 1
+              },
               "enabled": {
                 "type": "boolean",
                 "title": "启用",
