@@ -38,10 +38,31 @@ jobs:
             echo "SOURCE_LIB_STEM must match Cargo's cdylib name" >&2
             exit 1
           }
+      - name: Verify release version metadata
+        shell: bash
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          cargo_version="$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)"
+          descriptor_version="$(awk -F'"' '/^[[:space:]]*version = / { print $2; exit }' src/lib.rs)"
+          test -n "$cargo_version"
+          test "$descriptor_version" = "$cargo_version" || {
+            echo "dynamic descriptor version must match Cargo.toml" >&2
+            exit 1
+          }
+          grep -F 'api = "0.6"' src/lib.rs
+          if [ "$REF_TYPE" = "tag" ]; then
+            test "$REF_NAME" = "v$cargo_version" || {
+              echo "tag $REF_NAME must equal v$cargo_version" >&2
+              exit 1
+            }
+          fi
       - run: cargo +1.89.0 fmt --check
       - run: cargo +1.89.0 check --locked
       - run: cargo +1.89.0 test --locked
       - run: cargo +1.89.0 clippy --locked --all-targets
+      - run: cargo +1.89.0 build --locked --release
 
   linux-x64-gnu:
     needs: verify
@@ -136,6 +157,16 @@ jobs:
       - name: List release assets
         shell: bash
         run: find release-assets -maxdepth 1 -type f -printf '%f\n' | sort
+      - name: Verify release assets
+        shell: bash
+        run: |
+          windows_asset="qimen_dynamic_plugin_alicebot-x86_64-pc-windows-msvc.dll"
+          linux_asset="libqimen_dynamic_plugin_alicebot-x86_64-unknown-linux-gnu.so"
+          for asset in "$windows_asset" "$linux_asset"; do
+            test -s "release-assets/$asset"
+            test -s "release-assets/$asset.sha256"
+          done
+          (cd release-assets && sha256sum -c *.sha256)
       - name: Generate build provenance
         uses: actions/attest-build-provenance@v2
         with:
