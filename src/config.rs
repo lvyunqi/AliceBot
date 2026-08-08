@@ -136,6 +136,14 @@ pub struct LlmConfig {
     #[serde(default = "default_retry_limit")]
     pub retry_limit: u32,
 
+    /// Enable bounded native tool-calling for conversational replies.
+    #[serde(default = "default_true")]
+    pub agent_enabled: bool,
+
+    /// Maximum tool rounds per reply; kept deliberately small to bound cost.
+    #[serde(default = "default_agent_max_steps")]
+    pub agent_max_steps: u32,
+
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
 }
@@ -146,6 +154,8 @@ impl Default for LlmConfig {
             enabled: true,
             request_timeout_ms: default_llm_timeout(),
             retry_limit: default_retry_limit(),
+            agent_enabled: true,
+            agent_max_steps: default_agent_max_steps(),
             providers: Vec::new(),
         }
     }
@@ -157,6 +167,10 @@ fn default_llm_timeout() -> u64 {
 
 fn default_retry_limit() -> u32 {
     1
+}
+
+fn default_agent_max_steps() -> u32 {
+    3
 }
 
 #[derive(Clone, Deserialize)]
@@ -700,6 +714,9 @@ fn validate(config: &AppConfig) -> Result<(), String> {
     }
     if !(1..=3).contains(&stickers.max_chain) {
         return Err("stickers.max_chain must be between 1 and 3".to_string());
+    }
+    if !(1..=5).contains(&config.llm.agent_max_steps) {
+        return Err("llm.agent_max_steps must be between 1 and 5".to_string());
     }
 
     let mut provider_ids = HashSet::new();

@@ -28,16 +28,7 @@ impl OpenAiClient {
 impl Llm for OpenAiClient {
     async fn chat(&self, req: &ChatRequest) -> Result<ChatResponse, LlmError> {
         let url = format!("{}/chat/completions", self.base_url);
-        let mut messages: Vec<serde_json::Value> = req
-            .messages
-            .iter()
-            .map(|message| {
-                serde_json::json!({
-                    "role": message.role.as_str(),
-                    "content": content_value(message),
-                })
-            })
-            .collect();
+        let mut messages: Vec<serde_json::Value> = req.messages.iter().map(message_value).collect();
 
         if let Some(system) = req.system.as_deref()
             && !messages.iter().any(|message| message["role"] == "system")
@@ -51,13 +42,16 @@ impl Llm for OpenAiClient {
             );
         }
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": req.model,
             "messages": messages,
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
             "stream": false,
         });
+        if !req.tools.is_empty() {
+            body["tools"] = tools_value(&req.tools);
+        }
 
         let response = self
             .client
@@ -80,23 +74,56 @@ impl Llm for OpenAiClient {
             .json()
             .await
             .map_err(|_| response_parse_error("OpenAI"))?;
-        let text = data["choices"][0]["message"]["content"]
-            .as_str()
-            .ok_or_else(|| LlmError {
+        let message = data["choices"][0].get("message").ok_or_else(|| LlmError {
+            kind: ErrorKind::Parse,
+            message: "unable to parse OpenAI response".to_string(),
+        })?;
+        let text = message["content"].as_str().unwrap_or_default().to_string();
+        let tool_calls = message["tool_calls"]
+            .as_array()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|call| {
+                        let function = call.get("function")?;
+                        let name = function.get("name")?.as_str()?.trim();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        let id = call
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .unwrap_or("call-unknown");
+                        let arguments = function
+                            .get("arguments")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("{}");
+                        Some(ToolCall {
+                            id: id.chars().take(128).collect(),
+                            name: name.chars().take(80).collect(),
+                            arguments: arguments.chars().take(16_384).collect(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() && tool_calls.is_empty() {
+            return Err(LlmError {
                 kind: ErrorKind::Parse,
                 message: "unable to parse OpenAI response".to_string(),
-            })?
-            .to_string();
-        Ok(ChatResponse { text })
+            });
+        }
+        Ok(ChatResponse { text, tool_calls })
     }
 }
 
 fn content_value(message: &ChatMessage) -> serde_json::Value {
-    if message.image_urls.is_empty() {
+    if message.image_urls.is_empty() && message.image_data.is_empty() {
         return serde_json::json!(message.content);
     }
 
-    let mut parts = Vec::with_capacity(message.image_urls.len() + 1);
+    let mut parts = Vec::with_capacity(message.image_urls.len() + message.image_data.len() + 1);
     if !message.content.trim().is_empty() {
         parts.push(serde_json::json!({
             "type": "text",
@@ -109,7 +136,64 @@ fn content_value(message: &ChatMessage) -> serde_json::Value {
             "image_url": {"url": url},
         })
     }));
+    parts.extend(message.image_data.iter().map(|image| {
+        serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{};base64,{}", image.media_type, image.base64)},
+        })
+    }));
     serde_json::Value::Array(parts)
+}
+
+fn message_value(message: &ChatMessage) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "role": message.role.as_str(),
+        "content": content_value(message),
+    });
+    if !message.tool_calls.is_empty() {
+        value["tool_calls"] = serde_json::Value::Array(
+            message
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    serde_json::json!({
+                        "id": call.id,
+                        "type": "function",
+                        "function": {"name": call.name, "arguments": call.arguments},
+                    })
+                })
+                .collect(),
+        );
+        if message.content.trim().is_empty() {
+            value["content"] = serde_json::Value::Null;
+        }
+    }
+    if message.role == Role::Tool {
+        value["tool_call_id"] =
+            serde_json::json!(message.tool_call_id.as_deref().unwrap_or_default());
+    }
+    value
+}
+
+fn tools_value(tools: &[ChatTool]) -> serde_json::Value {
+    if tools.is_empty() {
+        return serde_json::Value::Null;
+    }
+    serde_json::Value::Array(
+        tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    }
+                })
+            })
+            .collect(),
+    )
 }
 
 fn status_error_kind(status: u16) -> ErrorKind {
@@ -140,6 +224,7 @@ mod tests {
             messages: vec![ChatMessage::user("hello")],
             temperature: 0.4,
             max_tokens: 64,
+            tools: Vec::new(),
         };
 
         let response = client
@@ -157,6 +242,42 @@ mod tests {
         assert_eq!(body["messages"][0]["content"], "be concise");
         assert_eq!(body["messages"][1]["content"], "hello");
         assert_eq!(body["stream"], false);
+        assert!(body.get("tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn serializes_tools_and_parses_tool_calls() {
+        let (base_url, server) = spawn_json_server(
+            200,
+            r#"{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","type":"function","function":{"name":"search_history","arguments":"{\"query\":\"图片\"}"}}]}}]}"#,
+        );
+        let client = OpenAiClient::new(&base_url, "test-key", Duration::from_secs(5));
+        let request = ChatRequest {
+            model: "mock-model".to_string(),
+            system: None,
+            messages: vec![ChatMessage::user("刚才谁发了图？")],
+            temperature: 0.0,
+            max_tokens: 64,
+            tools: vec![ChatTool {
+                name: "search_history".to_string(),
+                description: "read-only".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+        };
+
+        let response = client
+            .chat(&request)
+            .await
+            .expect("tool response should parse");
+        let raw_request = server.join().expect("mock server should finish");
+        let (_, body) = raw_request
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request should be JSON");
+        assert_eq!(body["tools"][0]["function"]["name"], "search_history");
+        assert_eq!(response.tool_calls[0].id, "call-1");
+        assert_eq!(response.tool_calls[0].name, "search_history");
+        assert_eq!(response.text, "");
     }
 
     #[tokio::test]
@@ -172,6 +293,7 @@ mod tests {
             messages: vec![ChatMessage::user("prompt-secret")],
             temperature: 0.4,
             max_tokens: 64,
+            tools: Vec::new(),
         };
 
         let error = client
@@ -200,6 +322,7 @@ mod tests {
             ],
             temperature: 0.2,
             max_tokens: 32,
+            tools: Vec::new(),
         };
 
         client
@@ -229,6 +352,7 @@ mod tests {
             messages: vec![ChatMessage::user("hello")],
             temperature: 0.4,
             max_tokens: 64,
+            tools: Vec::new(),
         };
 
         let error = client

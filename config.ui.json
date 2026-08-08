@@ -20,12 +20,15 @@
       }
     },
     "llm": {
-      "ui:order": ["enabled", "request_timeout_ms", "retry_limit", "providers"],
+      "ui:order": ["enabled", "request_timeout_ms", "retry_limit", "agent_enabled", "agent_max_steps", "providers"],
       "request_timeout_ms": {
         "unit": "毫秒"
       },
       "retry_limit": {
         "unit": "次"
+      },
+      "agent_max_steps": {
+        "unit": "轮"
       },
       "providers": {
         "items": {

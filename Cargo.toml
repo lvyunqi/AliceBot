@@ -1,6 +1,6 @@
 [package]
 name = "alicebot"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.89"
 description = "AliceBot - 最强学习力拟人QQ机器人，QimenBot动态插件"
@@ -27,6 +27,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 
 # 时间
 chrono = "0.4"

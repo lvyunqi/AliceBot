@@ -19,6 +19,9 @@ pub struct ContextMessage {
     pub speaker: String,
     pub timestamp: i64,
     pub is_key: bool,
+    /// In-memory media references from this turn. Signed URLs are never
+    /// persisted; they are converted to inline vision data before sending.
+    pub media: Vec<crate::pipeline::MediaRef>,
 }
 
 struct SessionContext {
@@ -72,6 +75,7 @@ pub async fn push(msg: &InMessage) {
             speaker: speaker_label(msg),
             timestamp: msg.timestamp,
             is_key: false,
+            media: msg.media.clone(),
         },
     );
 }
@@ -96,6 +100,7 @@ pub async fn push_assistant(
             speaker: String::new(),
             timestamp,
             is_key: false,
+            media: Vec::new(),
         },
     );
 }
@@ -289,7 +294,8 @@ pub(crate) fn restore_from_database(
         let mut inbound_statement = connection
             .prepare(
                 "SELECT id, COALESCE(event_key, ''), sender_id,
-                        COALESCE(sender_name, ''), content, has_media, created_at
+                        COALESCE(sender_name, ''), content, has_media,
+                        COALESCE(media_type, ''), COALESCE(media_url, ''), created_at
                  FROM messages
                  WHERE protocol = ?1 AND session_type = ?2 AND session_id = ?3
                    AND direction = 'inbound'
@@ -331,14 +337,25 @@ pub(crate) fn restore_from_database(
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
                             row.get::<_, i64>(5)? != 0,
-                            row.get::<_, i64>(6)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, i64>(8)?,
                         ))
                     },
                 )
                 .map_err(|error| error.to_string())?;
             for row in inbound_rows {
-                let (source_id, event_key, sender_id, sender_name, content, has_media, timestamp) =
-                    row.map_err(|error| error.to_string())?;
+                let (
+                    source_id,
+                    event_key,
+                    sender_id,
+                    sender_name,
+                    content,
+                    has_media,
+                    media_type,
+                    media_url,
+                    timestamp,
+                ) = row.map_err(|error| error.to_string())?;
                 let content = context_content(&content, &[], has_media);
                 if content.trim().is_empty() {
                     continue;
@@ -355,6 +372,18 @@ pub(crate) fn restore_from_database(
                         speaker: speaker_label_for(&route.protocol, &sender_id, &sender_name),
                         timestamp,
                         is_key: false,
+                        media: if media_url.is_empty() || media_url == "[invalid-media-url]" {
+                            Vec::new()
+                        } else {
+                            vec![crate::pipeline::MediaRef {
+                                url: media_url,
+                                media_type: if media_type.is_empty() {
+                                    "image".to_string()
+                                } else {
+                                    media_type
+                                },
+                            }]
+                        },
                     },
                     source_kind: 0,
                     source_id,
@@ -393,6 +422,7 @@ pub(crate) fn restore_from_database(
                         speaker: String::new(),
                         timestamp,
                         is_key: false,
+                        media: Vec::new(),
                     },
                     source_kind: 1,
                     source_id,

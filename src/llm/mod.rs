@@ -6,14 +6,16 @@ pub mod openai;
 pub(crate) mod test_support;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     System,
     User,
     Assistant,
+    Tool,
 }
 
 impl Role {
@@ -22,8 +24,23 @@ impl Role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "assistant",
+            Role::Tool => "tool",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
 }
 
 #[derive(Clone)]
@@ -33,6 +50,22 @@ pub struct ChatMessage {
     /// HTTPS image URLs that should be sent as multimodal content blocks.
     /// URLs are never included in Debug output or persisted in LLM audits.
     pub image_urls: Vec<String>,
+    /// Downloaded image payloads for temporary/signed media URLs.
+    pub image_data: Vec<ImageData>,
+    /// Native tool calls emitted by an assistant message.
+    pub tool_calls: Vec<ToolCall>,
+    /// Tool-call ID associated with a tool result message.
+    pub tool_call_id: Option<String>,
+    /// Keep a vision request marked even when a temporary image could not be
+    /// downloaded. This prevents the provider router from silently sending
+    /// the same turn to a text-only model.
+    pub vision_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageData {
+    pub media_type: String,
+    pub base64: String,
 }
 
 impl fmt::Debug for ChatMessage {
@@ -42,6 +75,9 @@ impl fmt::Debug for ChatMessage {
             .field("role", &self.role)
             .field("content_chars", &self.content.chars().count())
             .field("image_count", &self.image_urls.len())
+            .field("image_data_count", &self.image_data.len())
+            .field("tool_call_count", &self.tool_calls.len())
+            .field("vision_required", &self.vision_required)
             .finish()
     }
 }
@@ -52,6 +88,10 @@ impl ChatMessage {
             role: Role::System,
             content: content.into(),
             image_urls: Vec::new(),
+            image_data: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            vision_required: false,
         }
     }
 
@@ -60,6 +100,10 @@ impl ChatMessage {
             role: Role::User,
             content: content.into(),
             image_urls: Vec::new(),
+            image_data: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            vision_required: false,
         }
     }
 
@@ -68,6 +112,34 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             image_urls: Vec::new(),
+            image_data: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            vision_required: false,
+        }
+    }
+
+    pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: String::new(),
+            image_urls: Vec::new(),
+            image_data: Vec::new(),
+            tool_calls,
+            tool_call_id: None,
+            vision_required: false,
+        }
+    }
+
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: Role::Tool,
+            content: content.into(),
+            image_urls: Vec::new(),
+            image_data: Vec::new(),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            vision_required: false,
         }
     }
 
@@ -80,12 +152,27 @@ impl ChatMessage {
         self
     }
 
+    pub fn with_image_data(mut self, image_data: impl IntoIterator<Item = ImageData>) -> Self {
+        self.image_data = image_data.into_iter().take(4).collect();
+        self
+    }
+
+    pub fn require_vision(mut self) -> Self {
+        self.vision_required = true;
+        self
+    }
+
     pub fn has_images(&self) -> bool {
-        !self.image_urls.is_empty()
+        !self.image_urls.is_empty() || !self.image_data.is_empty()
+    }
+
+    pub fn needs_vision(&self) -> bool {
+        self.vision_required || self.has_images()
     }
 
     pub fn without_images(mut self) -> Self {
         self.image_urls.clear();
+        self.image_data.clear();
         self
     }
 }
@@ -97,6 +184,7 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub temperature: f32,
     pub max_tokens: u32,
+    pub tools: Vec<ChatTool>,
 }
 
 impl fmt::Debug for ChatRequest {
@@ -123,6 +211,7 @@ impl fmt::Debug for ChatRequest {
             )
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("tool_count", &self.tools.len())
             .finish()
     }
 }
@@ -130,6 +219,7 @@ impl fmt::Debug for ChatRequest {
 #[derive(Clone)]
 pub struct ChatResponse {
     pub text: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 impl fmt::Debug for ChatResponse {
@@ -137,6 +227,7 @@ impl fmt::Debug for ChatResponse {
         formatter
             .debug_struct("ChatResponse")
             .field("text_chars", &self.text.chars().count())
+            .field("tool_call_count", &self.tool_calls.len())
             .finish()
     }
 }
@@ -278,15 +369,29 @@ impl LlmClient {
     ) -> Result<ChatResponse, LlmError> {
         let mut last_error = None;
         let input_chars = input_chars(request);
+        let request_needs_vision = request_needs_vision(request);
+        if request_needs_vision && !provider_request_has_images(request) {
+            return Err(LlmError {
+                kind: ErrorKind::NoProvider,
+                message: "vision input could not be prepared".to_string(),
+            });
+        }
 
         for provider in &self.providers {
+            if request_needs_vision && !provider.supports_vision {
+                // Never silently ask a text-only model to guess what an image says.
+                // A later vision-capable provider may handle the request instead.
+                last_error = Some(LlmError {
+                    kind: ErrorKind::NoProvider,
+                    message: "provider does not support vision input".to_string(),
+                });
+                continue;
+            }
             let mut attempt = 0;
             loop {
                 let mut provider_request = request.clone();
                 if provider_request.model.trim().is_empty() {
-                    provider_request.model = if provider_request_has_images(&provider_request)
-                        && provider.supports_vision
-                    {
+                    provider_request.model = if request_needs_vision && provider.supports_vision {
                         provider
                             .vision_model
                             .clone()
@@ -294,13 +399,6 @@ impl LlmClient {
                     } else {
                         provider.model.clone()
                     };
-                }
-                if provider_request_has_images(&provider_request) && !provider.supports_vision {
-                    provider_request.messages = provider_request
-                        .messages
-                        .into_iter()
-                        .map(ChatMessage::without_images)
-                        .collect();
                 }
                 let audit_id = begin_audit(
                     task,
@@ -312,7 +410,9 @@ impl LlmClient {
                 let started = Instant::now();
 
                 match provider.client.chat(&provider_request).await {
-                    Ok(response) if !response.text.trim().is_empty() => {
+                    Ok(response)
+                        if !response.text.trim().is_empty() || !response.tool_calls.is_empty() =>
+                    {
                         finish_audit(
                             audit_id,
                             "success",
@@ -370,6 +470,10 @@ fn input_chars(request: &ChatRequest) -> usize {
 
 fn provider_request_has_images(request: &ChatRequest) -> bool {
     request.messages.iter().any(ChatMessage::has_images)
+}
+
+fn request_needs_vision(request: &ChatRequest) -> bool {
+    request.messages.iter().any(ChatMessage::needs_vision)
 }
 
 fn begin_audit(
@@ -463,6 +567,7 @@ mod tests {
             messages: vec![ChatMessage::user("你好")],
             temperature: 1.0,
             max_tokens: 10,
+            tools: Vec::new(),
         };
         assert_eq!(input_chars(&request), 8);
     }
@@ -475,9 +580,11 @@ mod tests {
             messages: vec![ChatMessage::user("user-prompt-secret")],
             temperature: 1.0,
             max_tokens: 10,
+            tools: Vec::new(),
         };
         let response = ChatResponse {
             text: "model-response-secret".to_string(),
+            tool_calls: Vec::new(),
         };
         let error = LlmError {
             kind: ErrorKind::InvalidRequest,
@@ -507,6 +614,7 @@ mod tests {
             } else {
                 Ok(ChatResponse {
                     text: "ok".to_string(),
+                    tool_calls: Vec::new(),
                 })
             }
         }
@@ -534,6 +642,7 @@ mod tests {
             messages: vec![ChatMessage::user("hello")],
             temperature: 1.0,
             max_tokens: 10,
+            tools: Vec::new(),
         };
         assert_eq!(client.chat(&request).await.unwrap().text, "ok");
     }
@@ -548,6 +657,7 @@ mod tests {
             *self.request.lock().expect("capture lock should work") = Some(req.clone());
             Ok(ChatResponse {
                 text: "ok".to_string(),
+                tool_calls: Vec::new(),
             })
         }
     }
@@ -577,6 +687,7 @@ mod tests {
             ],
             temperature: 0.0,
             max_tokens: 16,
+            tools: Vec::new(),
         };
 
         client
@@ -593,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn text_provider_receives_a_safe_text_only_fallback() {
+    async fn text_provider_is_skipped_for_vision_requests() {
         let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
         let client = LlmClient {
             providers: vec![ProviderClient {
@@ -617,18 +728,47 @@ mod tests {
             ],
             temperature: 0.0,
             max_tokens: 16,
+            tools: Vec::new(),
         };
 
-        client
+        let error = client
             .chat(&request)
             .await
-            .expect("fallback request should work");
-        let captured = capture
-            .lock()
-            .expect("capture lock should work")
-            .clone()
-            .expect("provider should receive a request");
-        assert_eq!(captured.model, "text-model");
-        assert!(captured.messages[0].image_urls.is_empty());
+            .expect_err("text-only providers must not receive vision requests");
+        assert_eq!(error.kind, ErrorKind::NoProvider);
+        assert!(capture.lock().expect("capture lock should work").is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_vision_preparation_never_downgrades_to_text() {
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let client = LlmClient {
+            providers: vec![ProviderClient {
+                id: "text".to_string(),
+                protocol: "test".to_string(),
+                model: "text-model".to_string(),
+                supports_vision: false,
+                vision_model: None,
+                client: Box::new(CaptureMock {
+                    request: capture.clone(),
+                }),
+            }],
+            retry_limit: 0,
+        };
+        let request = ChatRequest {
+            model: String::new(),
+            system: None,
+            messages: vec![ChatMessage::user("describe").require_vision()],
+            temperature: 0.0,
+            max_tokens: 16,
+            tools: Vec::new(),
+        };
+
+        let error = client
+            .chat(&request)
+            .await
+            .expect_err("missing vision data must fail before provider routing");
+        assert_eq!(error.kind, ErrorKind::NoProvider);
+        assert!(capture.lock().expect("capture lock should work").is_none());
     }
 }

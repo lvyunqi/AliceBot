@@ -613,7 +613,6 @@ mod tests {
     fn test_direct_ask() -> DirectAskTask {
         DirectAskTask {
             message: test_message("ask-1"),
-            prompt: "test".to_string(),
         }
     }
 

@@ -34,7 +34,11 @@ pub(crate) fn assemble(input: ContextInput<'_>) -> PromptAssembly {
     let current_cap = budget
         .saturating_sub(MIN_CORE_SYSTEM_BUDGET + CHAT_MESSAGE_OVERHEAD + 2)
         .max(1);
-    let current_turn = format_user_turn(&speaker_label(input.current), input.current_content);
+    let current_turn = format_current_turn(
+        &speaker_label(input.current),
+        input.current_content,
+        !input.current.reply_to_id.is_empty(),
+    );
     let current_message = ChatMessage::user(truncate_to_token_budget(&current_turn, current_cap));
     let mut messages = vec![current_message.clone()];
 
@@ -160,14 +164,18 @@ fn history_message(item: &ContextMessage) -> Option<ChatMessage> {
     if item.content.trim().is_empty() {
         return None;
     }
-    match item.role.as_str() {
+    let mut message = match item.role.as_str() {
         "user" => Some(ChatMessage::user(format_user_turn(
             &item.speaker,
             &item.content,
         ))),
         "assistant" => Some(ChatMessage::assistant(clean_message_text(&item.content))),
         _ => None,
+    }?;
+    if !item.media.is_empty() {
+        message.content.push_str("\n[该历史消息含图片或表情附件]");
     }
+    Some(message)
 }
 
 fn format_user_turn(speaker: &str, content: &str) -> String {
@@ -186,6 +194,22 @@ fn format_user_turn(speaker: &str, content: &str) -> String {
             content.trim()
         }
     )
+}
+
+fn format_current_turn(speaker: &str, content: &str, has_reference: bool) -> String {
+    let mut turn = format!(
+        "[当前消息]\n[当前发言者: {}]\n{}",
+        prompt_safe_label(speaker),
+        if clean_message_text(content).trim().is_empty() {
+            "[空消息]".to_string()
+        } else {
+            clean_message_text(content).trim().to_string()
+        }
+    );
+    if has_reference {
+        turn.push_str("\n[这是一条引用/回复；被引用消息的作者不是当前发言者]");
+    }
+    turn
 }
 
 fn prompt_safe_label(value: &str) -> String {
@@ -323,6 +347,7 @@ mod tests {
             speaker: speaker.to_string(),
             timestamp: 1,
             is_key: false,
+            media: Vec::new(),
         }
     }
 
@@ -444,5 +469,70 @@ mod tests {
         assert!(assembled.system.contains(CONTEXT_TRUST_POLICY));
         assert!(!assembled.system.contains("<system>"));
         assert!(assembled.system.contains("＜system＞"));
+    }
+
+    #[test]
+    fn historical_media_is_metadata_until_current_turn_references_it() {
+        let current = message("current", "普通聊天");
+        let history = vec![ContextMessage {
+            event_key: "image-event".to_string(),
+            role: "user".to_string(),
+            content: "上一条图片".to_string(),
+            speaker: "听雨#abc123".to_string(),
+            timestamp: 1,
+            is_key: false,
+            media: vec![crate::pipeline::MediaRef {
+                url: "https://example.test/image.png".to_string(),
+                media_type: "image/png".to_string(),
+            }],
+        }];
+
+        let assembled = assemble(ContextInput {
+            base_system: "核心人设",
+            profile: None,
+            long_memories: &[],
+            history: &history,
+            current: &current,
+            current_content: &current.content,
+            source_event_keys: &["current".to_string()],
+            configured_budget: 512,
+        });
+
+        assert!(
+            assembled
+                .messages
+                .iter()
+                .all(|message| !message.has_images())
+        );
+        assert!(
+            assembled
+                .messages
+                .iter()
+                .any(|message| message.content.contains("含图片或表情附件"))
+        );
+    }
+
+    #[test]
+    fn current_reference_turn_separates_sender_from_quoted_author() {
+        let mut current = message("current", "这个图是什么意思");
+        current.reply_to_id = "opaque-reference".to_string();
+        let assembled = assemble(ContextInput {
+            base_system: "核心人设",
+            profile: None,
+            long_memories: &[],
+            history: &[],
+            current: &current,
+            current_content: &current.content,
+            source_event_keys: &["current".to_string()],
+            configured_budget: 512,
+        });
+        let current_turn = assembled.messages.last().expect("current turn exists");
+        assert!(current_turn.content.contains("[当前发言者: 当前用户#"));
+        assert!(current_turn.content.contains("引用/回复"));
+        assert!(
+            current_turn
+                .content
+                .contains("被引用消息的作者不是当前发言者")
+        );
     }
 }

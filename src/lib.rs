@@ -68,7 +68,7 @@ fn accept_inbound_message(req: &InterceptorRequest) {
 
 #[dynamic_plugin(
     id = "alicebot",
-    version = "0.2.0",
+    version = "0.2.1",
     api = "0.6",
     config_schema = "../config.schema.json",
     config_ui = "../config.ui.json",

@@ -78,6 +78,20 @@
           "maximum": 3,
           "default": 1
         },
+        "agent_enabled": {
+          "type": "boolean",
+          "title": "启用智能工具查询",
+          "description": "允许模型在回答前按需查询近期对话和长期记忆；工具只读且有步数上限。",
+          "default": true
+        },
+        "agent_max_steps": {
+          "type": "integer",
+          "title": "工具查询轮数上限",
+          "description": "单条回复最多连续调用工具的轮数，建议 2-3。",
+          "minimum": 1,
+          "maximum": 5,
+          "default": 3
+        },
         "providers": {
           "type": "array",
           "title": "模型列表",
