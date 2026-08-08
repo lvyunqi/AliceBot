@@ -29,7 +29,7 @@
       },
       "providers": {
         "items": {
-          "ui:order": ["id", "protocol", "base_url", "model", "api_key", "priority", "enabled"],
+          "ui:order": ["id", "protocol", "base_url", "model", "supports_vision", "vision_model", "api_key", "priority", "enabled"],
           "api_key": {
             "ui:widget": "password",
             "ui:placeholder": "输入 API Key（不回显）"
@@ -38,6 +38,9 @@
             "ui:placeholder": "https://api.openai.com/v1"
           },
           "model": {
+            "ui:placeholder": "gpt-4o-mini"
+          },
+          "vision_model": {
             "ui:placeholder": "gpt-4o-mini"
           }
         }

@@ -180,6 +180,14 @@ pub struct ProviderConfig {
 
     #[serde(default)]
     pub priority: u32,
+
+    /// Whether this provider/model accepts image content blocks.
+    #[serde(default)]
+    pub supports_vision: bool,
+
+    /// Optional model override used when the current turn contains images.
+    #[serde(default)]
+    pub vision_model: Option<String>,
 }
 
 impl fmt::Debug for ProviderConfig {
@@ -193,6 +201,8 @@ impl fmt::Debug for ProviderConfig {
             .field("model", &self.model)
             .field("enabled", &self.enabled)
             .field("priority", &self.priority)
+            .field("supports_vision", &self.supports_vision)
+            .field("vision_model", &self.vision_model)
             .finish()
     }
 }
@@ -707,6 +717,13 @@ fn validate(config: &AppConfig) -> Result<(), String> {
                 provider.protocol
             ));
         }
+        if provider
+            .vision_model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(format!("vision_model for provider {id} cannot be empty"));
+        }
         let url = reqwest::Url::parse(&provider.base_url)
             .map_err(|_| format!("invalid base_url for provider {id}"))?;
         if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -834,6 +851,8 @@ mod tests {
         assert!(schema["properties"]["privacy"]["properties"]["store_raw_events"].is_object());
         assert!(schema["properties"]["observability"]["properties"]["decision_trace"].is_object());
         assert!(schema["properties"]["stickers"]["properties"]["daily_collect_limit"].is_object());
+        assert!(schema["properties"]["llm"]["properties"]["providers"]["items"]["properties"]["supports_vision"].is_object());
+        assert!(schema["properties"]["llm"]["properties"]["providers"]["items"]["properties"]["vision_model"].is_object());
         let provider_required =
             schema["properties"]["llm"]["properties"]["providers"]["items"]["required"]
                 .as_array()
@@ -873,6 +892,25 @@ mod tests {
         )
         .expect("a provider without a secret should remain a valid disabled route");
         assert_eq!(config.llm.providers[0].api_key, "");
+    }
+
+    #[test]
+    fn vision_provider_configuration_is_optional_and_validated() {
+        let config = parse_and_validate_config(
+            r#"{"llm":{"providers":[{"id":"vision","protocol":"openai","base_url":"https://example.test/v1","model":"text","supports_vision":true,"vision_model":"vision"}]}}"#,
+        )
+        .expect("vision provider should be valid");
+        assert!(config.llm.providers[0].supports_vision);
+        assert_eq!(
+            config.llm.providers[0].vision_model.as_deref(),
+            Some("vision")
+        );
+
+        let error = parse_and_validate_config(
+            r#"{"llm":{"providers":[{"id":"vision","protocol":"openai","base_url":"https://example.test/v1","model":"text","vision_model":" "}]}}"#,
+        )
+        .expect_err("blank vision model should fail");
+        assert!(error.contains("vision_model"));
     }
 
     #[test]

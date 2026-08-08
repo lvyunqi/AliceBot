@@ -34,11 +34,11 @@ impl Llm for AnthropicClient {
                 Role::System => {}
                 Role::User => messages.push(serde_json::json!({
                     "role": "user",
-                    "content": message.content,
+                    "content": content_value(message),
                 })),
                 Role::Assistant => messages.push(serde_json::json!({
                     "role": "assistant",
-                    "content": message.content,
+                    "content": content_value(message),
                 })),
             }
         }
@@ -110,6 +110,27 @@ impl Llm for AnthropicClient {
     }
 }
 
+fn content_value(message: &ChatMessage) -> serde_json::Value {
+    if message.image_urls.is_empty() {
+        return serde_json::json!(message.content);
+    }
+
+    let mut blocks = Vec::with_capacity(message.image_urls.len() + 1);
+    if !message.content.trim().is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
+    blocks.extend(message.image_urls.iter().map(|url| {
+        serde_json::json!({
+            "type": "image",
+            "source": {"type": "url", "url": url},
+        })
+    }));
+    serde_json::Value::Array(blocks)
+}
+
 fn status_error_kind(status: u16) -> ErrorKind {
     match status {
         401 => ErrorKind::Auth,
@@ -179,6 +200,36 @@ mod tests {
             .await
             .expect_err("invalid history should fail");
         assert_eq!(error.kind, ErrorKind::InvalidRequest);
+    }
+
+    #[tokio::test]
+    async fn serializes_anthropic_vision_content_blocks() {
+        let (base_url, server) =
+            spawn_json_server(200, r#"{"content":[{"type":"text","text":"cat"}]}"#);
+        let client = AnthropicClient::new(&base_url, "test-key", Duration::from_secs(5));
+        let request = ChatRequest {
+            model: "claude-vision".to_string(),
+            system: None,
+            messages: vec![
+                ChatMessage::user("describe this")
+                    .with_image_urls(vec!["https://example.test/cat.png".to_string()]),
+            ],
+            temperature: 0.2,
+            max_tokens: 32,
+        };
+
+        client
+            .chat(&request)
+            .await
+            .expect("mock response should parse");
+        let raw_request = server.join().expect("mock server should finish");
+        let (_, body) = raw_request
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request should be JSON");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(body["messages"][0]["content"][1]["source"]["type"], "url");
     }
 
     #[tokio::test]

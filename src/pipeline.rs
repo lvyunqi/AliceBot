@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::config::AppConfig;
 use crate::db::Database;
 use crate::decision;
-use crate::llm::{ChatMessage, ChatRequest, ChatResponse, ErrorKind, LlmClient, LlmError};
+use crate::llm::{ChatMessage, ChatRequest, ChatResponse, ErrorKind, LlmClient, LlmError, Role};
 use crate::memory;
 use crate::send;
 use crate::stickers;
@@ -91,6 +91,27 @@ pub struct InMessage {
 pub(crate) struct DirectAskTask {
     pub(crate) message: InMessage,
     pub(crate) prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StickerRequestResult {
+    Sent,
+    Disabled,
+    Unsupported,
+    NotFound,
+    Failed,
+}
+
+impl StickerRequestResult {
+    pub(crate) fn user_message(self) -> &'static str {
+        match self {
+            Self::Sent => "来啦～",
+            Self::Disabled => "表情包功能目前已关闭。",
+            Self::Unsupported => "当前聊天平台还没有验证图片发送能力，我不会假装已经发出。",
+            Self::NotFound => "我还没有找到匹配的表情包，先发一张图片或表情包让我收藏吧。",
+            Self::Failed => "图片发送没有被宿主接受，我没有把它说成已发送。",
+        }
+    }
 }
 
 impl DirectAskTask {
@@ -255,6 +276,118 @@ pub async fn process_recorded_message(msg: InMessage) {
     );
 }
 
+/// Send one explicitly requested sticker and report the host outcome.
+/// This path is deterministic and never delegates the send decision to an LLM.
+pub(crate) async fn execute_sticker_request(
+    msg: &InMessage,
+    keyword: &str,
+) -> StickerRequestResult {
+    let config = current_config();
+    if !config.stickers.enabled {
+        return StickerRequestResult::Disabled;
+    }
+    if stickers::send::url_image_capability(&msg.protocol)
+        != stickers::send::UrlImageCapability::Supported
+    {
+        return StickerRequestResult::Unsupported;
+    }
+
+    let policy = stickers::send::SendPolicy {
+        max_chain: 1,
+        daily_send_limit: config.stickers.daily_send_limit,
+        cooldown_sec: config.stickers.sticker_cooldown_sec,
+    };
+    let mut candidates = stickers::send::choose_chain_for_route(
+        &msg.protocol,
+        &msg.session_type,
+        &msg.session_id,
+        keyword,
+        policy,
+    )
+    .await;
+    if candidates.is_empty() && keyword != "image" {
+        candidates = stickers::send::choose_chain_for_route(
+            &msg.protocol,
+            &msg.session_type,
+            &msg.session_id,
+            "image",
+            policy,
+        )
+        .await;
+    }
+    let Some(candidate) = candidates.into_iter().next() else {
+        return StickerRequestResult::NotFound;
+    };
+
+    let event_key = format!("{}:sticker-request", msg.event_key);
+    if send::send_image_url_for_event(
+        &msg.bot_account_id,
+        &msg.protocol,
+        &msg.session_id,
+        &msg.session_type,
+        &candidate.url,
+        None,
+        Some(&event_key),
+    )
+    .await
+    {
+        stickers::send::record_accepted_delivery(candidate.sticker_id, &msg.protocol);
+        StickerRequestResult::Sent
+    } else {
+        StickerRequestResult::Failed
+    }
+}
+
+fn requested_sticker_keyword(message: &InMessage) -> Option<String> {
+    if !message.at_me {
+        return None;
+    }
+    let text = message.content.trim();
+    if text.is_empty() {
+        return None;
+    }
+    const MARKERS: &[&str] = &[
+        "表情包",
+        "表情",
+        "梗图",
+        "沙雕图",
+        "发图",
+        "发个图",
+        "来张图",
+        "来个图",
+        "图片",
+    ];
+    if !MARKERS.iter().any(|marker| text.contains(marker)) {
+        return None;
+    }
+    const TAG_HINTS: &[&str] = &[
+        "开心", "难过", "生气", "哈哈", "无语", "震惊", "可爱", "猫", "狗", "谢谢", "恭喜", "问号",
+        "游戏", "加班", "下雨",
+    ];
+    if let Some(tag) = TAG_HINTS.iter().find(|tag| text.contains(**tag)) {
+        return Some((*tag).to_string());
+    }
+    let mut keyword = text.to_string();
+    for marker in MARKERS {
+        keyword = keyword.replace(marker, " ");
+    }
+    let keyword = keyword
+        .split_whitespace()
+        .filter(|part| {
+            !matches!(
+                *part,
+                "发" | "来" | "给" | "个" | "张" | "一张" | "一个" | "整" | "整个" | "要"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(if keyword.is_empty() {
+        "image".to_string()
+    } else {
+        keyword
+    })
+}
+
 pub fn mark_record_only(event_key: &str, reason: &str) {
     let Some(database) = try_db() else {
         return;
@@ -314,6 +447,20 @@ async fn process_recorded_message_inner(msg: InMessage) {
     decision::record_coalesced(&batch);
     let coalesced_count = batch.source_event_keys.len();
     let msg = batch.message;
+
+    if let Some(keyword) = requested_sticker_keyword(&msg) {
+        let result = execute_sticker_request(&msg, &keyword).await;
+        let _ = send::send_text_for_event(
+            &msg.bot_account_id,
+            &msg.protocol,
+            &msg.session_id,
+            &msg.session_type,
+            result.user_message(),
+            Some(&msg.event_key),
+        )
+        .await;
+        return;
+    }
 
     let (should_reply, style_hint) = decision::should_reply_with_style(&msg, coalesced_count).await;
     if !should_reply {
@@ -802,7 +949,7 @@ async fn generate_reply(
         base_system.push_str(style_hint.as_str());
         base_system.push_str("。这只是语气建议；安全规则、事实准确性和用户请求优先。");
     }
-    let assembled = memory::assemble_prompt_context(memory::ContextInput {
+    let mut assembled = memory::assemble_prompt_context(memory::ContextInput {
         base_system: &base_system,
         profile: profile.as_deref(),
         long_memories: &long_memories,
@@ -812,6 +959,15 @@ async fn generate_reply(
         source_event_keys,
         configured_budget: state.config.behavior.max_context_tokens,
     });
+    let image_urls = vision_media_urls(msg);
+    if let Some(current_message) = assembled
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| matches!(message.role, Role::User))
+    {
+        current_message.image_urls = image_urls;
+    }
     log::trace!(
         "[AliceBot] assembled prompt context: estimated_tokens={}, messages={}",
         assembled.estimated_tokens,
@@ -831,6 +987,26 @@ async fn generate_reply(
         .await
         .map(|response| response.text.trim().to_string())
         .map_err(|error| format!("{:?}", error.kind))
+}
+
+fn vision_media_urls(message: &InMessage) -> Vec<String> {
+    message
+        .media
+        .iter()
+        .filter(|media| {
+            media.media_type.starts_with("image/")
+                || matches!(media.media_type.as_str(), "image" | "mface" | "face")
+                || media.url.to_ascii_lowercase().contains(".png")
+                || media.url.to_ascii_lowercase().contains(".jpg")
+                || media.url.to_ascii_lowercase().contains(".jpeg")
+                || media.url.to_ascii_lowercase().contains(".webp")
+                || media.url.to_ascii_lowercase().contains(".gif")
+        })
+        .filter_map(|media| crate::media::sanitize_remote_media_url(&media.url, true))
+        .filter(|media| !media.requires_cache)
+        .map(|media| media.storage_url)
+        .take(4)
+        .collect()
 }
 
 /// 执行 ReplyJudge 的最小分类请求；状态缺失或无可用 provider 时由调用方回退规则评分。
@@ -925,7 +1101,11 @@ fn persona_prompt(config: &AppConfig) -> String {
         config.persona.background,
         config.persona.speaking_style,
     );
-    format!("{base}\n{typo_instruction}\n{emoji_instruction}")
+    format!(
+        "{base}\n{typo_instruction}\n{emoji_instruction}\n\
+         Only describe an image when an image content block is present in this request.\n\
+         Never claim that an image, sticker, or other media was sent unless the host delivery result is explicitly confirmed."
+    )
 }
 
 struct StatusMetrics {
@@ -1247,6 +1427,68 @@ mod tests {
         suppress_autonomous_reply_for_command(&request);
         assert!(take_command_suppression(&interceptor_event_key));
         assert!(!take_command_suppression(&interceptor_event_key));
+    }
+
+    fn request_message(content: &str, at_me: bool) -> InMessage {
+        InMessage {
+            event_key: "onebot11:request".to_string(),
+            protocol: "onebot11".to_string(),
+            bot_account_id: "bot-account".to_string(),
+            session_type: "group".to_string(),
+            session_id: "group-1".to_string(),
+            sender_id: "member-1".to_string(),
+            sender_name: "tester".to_string(),
+            message_id: "request".to_string(),
+            reply_to_id: String::new(),
+            content: content.to_string(),
+            media: Vec::new(),
+            has_media: false,
+            at_me,
+            timestamp: 1,
+            safe_raw_json: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn sticker_request_requires_an_explicit_mention() {
+        assert!(requested_sticker_keyword(&request_message("来个表情包", true)).is_some());
+        assert!(requested_sticker_keyword(&request_message("来个表情包", false)).is_none());
+        assert!(requested_sticker_keyword(&request_message("你好", true)).is_none());
+    }
+
+    #[test]
+    fn vision_input_keeps_only_public_image_urls() {
+        let mut message = request_message("看看这张图", true);
+        message.media = vec![
+            MediaRef {
+                url: "https://example.test/public.png".to_string(),
+                media_type: "image/png".to_string(),
+            },
+            MediaRef {
+                url: "https://example.test/signed.png?rkey=temporary".to_string(),
+                media_type: "image/png".to_string(),
+            },
+            MediaRef {
+                url: "https://example.test/audio.mp3".to_string(),
+                media_type: "audio/mpeg".to_string(),
+            },
+        ];
+        let urls = vision_media_urls(&message);
+        assert_eq!(urls, vec!["https://example.test/public.png"]);
+    }
+
+    #[test]
+    fn sticker_failure_messages_do_not_claim_delivery() {
+        assert!(
+            StickerRequestResult::Unsupported
+                .user_message()
+                .contains("不会假装")
+        );
+        assert!(
+            StickerRequestResult::Failed
+                .user_message()
+                .contains("没有把它说成已发送")
+        );
     }
 
     #[test]
