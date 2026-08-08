@@ -137,7 +137,7 @@ jobs:
           .\scripts\package-release.ps1 -Target $env:TARGET -InputPath "target\$env:TARGET\release\alicebot.dll" -OutputDirectory release-assets
           $asset = Get-Item -LiteralPath "release-assets\$env:ASSET_LIB_STEM-$env:TARGET.dll"
           $sha256 = (Get-FileHash -LiteralPath $asset.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$sha256  $($asset.Name)" | Set-Content -LiteralPath "$($asset.FullName).sha256" -Encoding ascii
+          [IO.File]::WriteAllText("$($asset.FullName).sha256", "$sha256  $($asset.Name)`n", [Text.UTF8Encoding]::new($false))
       - uses: actions/upload-artifact@v4
         with:
           name: alicebot-${{ env.TARGET }}
