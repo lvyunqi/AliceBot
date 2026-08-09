@@ -63,6 +63,7 @@ const MIN_MAX_MESSAGES: usize = 5;
 const MAX_MAX_MESSAGES: usize = 200;
 const RESTORE_LOOKBACK_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const RESTORE_ROUTE_SCAN_MULTIPLIER: usize = 16;
+const UNAVAILABLE_RESTORED_MEDIA_URL: &str = "[temporary-media-unavailable-after-restart]";
 
 /// 推入用户消息。
 pub async fn push(msg: &InMessage) {
@@ -295,7 +296,8 @@ pub(crate) fn restore_from_database(
             .prepare(
                 "SELECT id, COALESCE(event_key, ''), sender_id,
                         COALESCE(sender_name, ''), content, has_media,
-                        COALESCE(media_type, ''), COALESCE(media_url, ''), created_at
+                        COALESCE(media_type, ''), COALESCE(media_url, ''),
+                        COALESCE(media_requires_cache, 1), created_at
                  FROM messages
                  WHERE protocol = ?1 AND session_type = ?2 AND session_id = ?3
                    AND direction = 'inbound'
@@ -339,7 +341,8 @@ pub(crate) fn restore_from_database(
                             row.get::<_, i64>(5)? != 0,
                             row.get::<_, String>(6)?,
                             row.get::<_, String>(7)?,
-                            row.get::<_, i64>(8)?,
+                            row.get::<_, i64>(8)? != 0,
+                            row.get::<_, i64>(9)?,
                         ))
                     },
                 )
@@ -354,6 +357,7 @@ pub(crate) fn restore_from_database(
                     has_media,
                     media_type,
                     media_url,
+                    media_requires_cache,
                     timestamp,
                 ) = row.map_err(|error| error.to_string())?;
                 let content = context_content(&content, &[], has_media);
@@ -372,18 +376,7 @@ pub(crate) fn restore_from_database(
                         speaker: speaker_label_for(&route.protocol, &sender_id, &sender_name),
                         timestamp,
                         is_key: false,
-                        media: if media_url.is_empty() || media_url == "[invalid-media-url]" {
-                            Vec::new()
-                        } else {
-                            vec![crate::pipeline::MediaRef {
-                                url: media_url,
-                                media_type: if media_type.is_empty() {
-                                    "image".to_string()
-                                } else {
-                                    media_type
-                                },
-                            }]
-                        },
+                        media: restored_media(media_type, media_url, media_requires_cache),
                     },
                     source_kind: 0,
                     source_id,
@@ -582,6 +575,28 @@ fn context_content(content: &str, media: &[crate::pipeline::MediaRef], has_media
     String::new()
 }
 
+fn restored_media(
+    media_type: String,
+    media_url: String,
+    media_requires_cache: bool,
+) -> Vec<crate::pipeline::MediaRef> {
+    if media_url.is_empty() || media_url == "[invalid-media-url]" {
+        return Vec::new();
+    }
+    vec![crate::pipeline::MediaRef {
+        url: if media_requires_cache {
+            UNAVAILABLE_RESTORED_MEDIA_URL.to_string()
+        } else {
+            media_url
+        },
+        media_type: if media_type.is_empty() {
+            "image".to_string()
+        } else {
+            media_type
+        },
+    }]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,6 +697,25 @@ mod tests {
         assert_ne!(speaker_label(&onebot), speaker_label(&official));
         assert!(!speaker_label(&onebot).contains(&onebot.sender_id));
         clear();
+    }
+
+    #[test]
+    fn restored_temporary_media_keeps_the_image_fact_without_a_dead_url() {
+        let media = restored_media(
+            "image/jpeg".to_string(),
+            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc".to_string(),
+            true,
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].media_type, "image/jpeg");
+        assert_eq!(media[0].url, UNAVAILABLE_RESTORED_MEDIA_URL);
+
+        let public_media = restored_media(
+            "image/png".to_string(),
+            "https://example.test/image.png".to_string(),
+            false,
+        );
+        assert_eq!(public_media[0].url, "https://example.test/image.png");
     }
 
     #[allow(clippy::too_many_arguments)] // Test fixture mirrors the journal's route/state fields.
