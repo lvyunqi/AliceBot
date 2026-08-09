@@ -118,7 +118,7 @@ impl StickerRequestResult {
         match self {
             Self::Sent => "来啦～",
             Self::Disabled => "表情包功能目前已关闭。",
-            Self::Unsupported => "当前聊天平台还没有验证图片发送能力，我不会假装已经发出。",
+            Self::Unsupported => "当前聊天平台不支持图片发送，我不会假装已经发出。",
             Self::NotFound => "我还没有找到匹配的表情包，先发一张图片或表情包让我收藏吧。",
             Self::Failed => "图片发送没有被宿主接受，我没有把它说成已发送。",
         }
