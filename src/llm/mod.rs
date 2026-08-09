@@ -387,6 +387,25 @@ impl LlmClient {
                 });
                 continue;
             }
+            if request_needs_vision {
+                let (remote_images, inline_images) = vision_input_counts(request);
+                let model = if request.model.trim().is_empty() {
+                    provider
+                        .vision_model
+                        .as_deref()
+                        .unwrap_or(provider.model.as_str())
+                } else {
+                    request.model.as_str()
+                };
+                log::debug!(
+                    "[AliceBot] vision request encoded: task={}, provider={}, model={}, remote_images={}, inline_images={}",
+                    task,
+                    provider.id,
+                    model,
+                    remote_images,
+                    inline_images
+                );
+            }
             let mut attempt = 0;
             loop {
                 let mut provider_request = request.clone();
@@ -470,6 +489,18 @@ fn input_chars(request: &ChatRequest) -> usize {
 
 fn provider_request_has_images(request: &ChatRequest) -> bool {
     request.messages.iter().any(ChatMessage::has_images)
+}
+
+fn vision_input_counts(request: &ChatRequest) -> (usize, usize) {
+    request
+        .messages
+        .iter()
+        .fold((0, 0), |(remote, inline), message| {
+            (
+                remote.saturating_add(message.image_urls.len()),
+                inline.saturating_add(message.image_data.len()),
+            )
+        })
 }
 
 fn request_needs_vision(request: &ChatRequest) -> bool {

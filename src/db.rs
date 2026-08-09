@@ -129,13 +129,17 @@ impl Database {
             .media
             .first()
             .map(|media| crate::media::redact_url_for_storage(&media.url));
+        let media_requires_cache = msg.media.first().is_some_and(|media| {
+            crate::media::sanitize_remote_media_url(&media.url, false)
+                .is_some_and(|media| media.requires_cache)
+        });
         let raw_json = store_raw_events.then_some(msg.safe_raw_json.as_str());
         let changed = conn.execute(
             "INSERT OR IGNORE INTO messages
              (event_key, protocol, bot_account_id, direction, session_type, session_id, sender_id,
               sender_name, message_id, content, raw_json, has_media, media_type,
-              media_url, reply_to_id, at_me, processing_status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'recorded', ?16, ?16)",
+              media_url, media_requires_cache, reply_to_id, at_me, processing_status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'recorded', ?17, ?17)",
             params![
                 msg.event_key,
                 msg.protocol,
@@ -150,6 +154,7 @@ impl Database {
                 msg.has_media as i32,
                 media_type,
                 media_url,
+                media_requires_cache as i32,
                 msg.reply_to_id,
                 msg.at_me as i32,
                 msg.timestamp,
@@ -562,6 +567,46 @@ mod tests {
             ("record_only".to_string(), "queue_full".to_string())
         );
 
+        drop(database);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn signed_media_url_records_cache_requirement_without_persisting_credential() {
+        let path = std::env::temp_dir().join(format!(
+            "alicebot-db-media-test-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let database = Database::open(path.to_str().expect("temporary path is not UTF-8"))
+            .expect("database should open");
+        let mut message = test_message("qq-official:media-1");
+        message.has_media = true;
+        message.media = vec![crate::pipeline::MediaRef {
+            url: "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=temporary&spec=0"
+                .to_string(),
+            media_type: "image/jpeg".to_string(),
+        }];
+
+        assert!(
+            database
+                .insert_message(&message)
+                .expect("message should insert")
+        );
+        let row: (String, i64) = database
+            .conn
+            .lock()
+            .expect("database lock should work")
+            .query_row(
+                "SELECT media_url, media_requires_cache FROM messages WHERE event_key = ?1",
+                params![message.event_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("media row should exist");
+        assert!(!row.0.contains("rkey"));
+        assert_eq!(row.1, 1);
         drop(database);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));

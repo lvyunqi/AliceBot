@@ -159,13 +159,9 @@ fn content_value(message: &ChatMessage) -> serde_json::Value {
         return serde_json::json!(message.content);
     }
 
+    // Keep the image before the question for gateways and models that choose
+    // the visual encoder from the first content block.
     let mut blocks = Vec::with_capacity(message.image_urls.len() + message.image_data.len() + 1);
-    if !message.content.trim().is_empty() {
-        blocks.push(serde_json::json!({
-            "type": "text",
-            "text": message.content,
-        }));
-    }
     blocks.extend(message.image_urls.iter().map(|url| {
         serde_json::json!({
             "type": "image",
@@ -182,6 +178,12 @@ fn content_value(message: &ChatMessage) -> serde_json::Value {
             },
         })
     }));
+    if !message.content.trim().is_empty() {
+        blocks.push(serde_json::json!({
+            "type": "text",
+            "text": message.content,
+        }));
+    }
     serde_json::Value::Array(blocks)
 }
 
@@ -318,9 +320,45 @@ mod tests {
             .split_once("\r\n\r\n")
             .expect("request should contain headers");
         let body: serde_json::Value = serde_json::from_str(body).expect("request should be JSON");
-        assert_eq!(body["messages"][0]["content"][0]["type"], "text");
-        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
-        assert_eq!(body["messages"][0]["content"][1]["source"]["type"], "url");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(body["messages"][0]["content"][1]["type"], "text");
+        assert_eq!(body["messages"][0]["content"][0]["source"]["type"], "url");
+    }
+
+    #[tokio::test]
+    async fn serializes_anthropic_inline_vision_data() {
+        let (base_url, server) =
+            spawn_json_server(200, r#"{"content":[{"type":"text","text":"cat"}]}"#);
+        let client = AnthropicClient::new(&base_url, "test-key", Duration::from_secs(5));
+        let request = ChatRequest {
+            model: "claude-vision".to_string(),
+            system: None,
+            messages: vec![
+                ChatMessage::user("describe this").with_image_data(vec![ImageData {
+                    media_type: "image/jpeg".to_string(),
+                    base64: "/9j/".to_string(),
+                }]),
+            ],
+            temperature: 0.2,
+            max_tokens: 32,
+            tools: Vec::new(),
+        };
+
+        client
+            .chat(&request)
+            .await
+            .expect("mock response should parse");
+        let raw_request = server.join().expect("mock server should finish");
+        let (_, body) = raw_request
+            .split_once("\r\n\r\n")
+            .expect("request should contain headers");
+        let body: serde_json::Value = serde_json::from_str(body).expect("request should be JSON");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "image");
+        assert_eq!(
+            body["messages"][0]["content"][0]["source"]["media_type"],
+            "image/jpeg"
+        );
+        assert_eq!(body["messages"][0]["content"][0]["source"]["data"], "/9j/");
     }
 
     #[tokio::test]

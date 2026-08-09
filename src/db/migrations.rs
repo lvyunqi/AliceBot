@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 16;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 17;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -132,6 +132,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         14 => migration_14_media_url_privacy(transaction)?,
         15 => migration_15_sticker_cache(transaction)?,
         16 => migration_16_sticker_graph(transaction)?,
+        17 => migration_17_media_history_availability(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -1025,6 +1026,28 @@ fn migration_16_sticker_graph(conn: &Connection) -> Result<(), rusqlite::Error> 
     Ok(())
 }
 
+fn migration_17_media_history_availability(conn: &Connection) -> Result<(), rusqlite::Error> {
+    // A sanitized temporary URL is useful for audit identity but cannot be
+    // fetched after restart. Mark existing rows conservatively so recovery
+    // keeps the media fact without passing a stale URL to a vision provider.
+    ensure_column(
+        conn,
+        "messages",
+        "media_requires_cache",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    conn.execute_batch(
+        r#"
+        UPDATE messages
+        SET media_requires_cache = 1
+        WHERE media_url IS NOT NULL
+          AND TRIM(media_url) <> ''
+          AND media_url <> '[invalid-media-url]';
+        "#,
+    )?;
+    Ok(())
+}
+
 fn sanitize_media_url_column(conn: &Connection, table: &str) -> Result<(), rusqlite::Error> {
     let rows = {
         let mut statement = conn.prepare(&format!(
@@ -1075,6 +1098,7 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "bot_account_id",
                 "content",
                 "media_url",
+                "media_requires_cache",
                 "processing_status",
                 "processing_error",
                 "processed_at",
@@ -2129,6 +2153,45 @@ mod tests {
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(read_schema_version(&backup).unwrap(), 15);
         assert!(!column_exists(&backup, "sticker_links", "weight").unwrap());
+    }
+
+    #[test]
+    fn version_sixteen_database_marks_legacy_media_as_cache_only() {
+        let temporary = TempDatabase::new("version-sixteen");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 16).unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (event_key, protocol, direction, session_type, session_id, sender_id,
+                  content, media_url, created_at)
+                 VALUES ('legacy-media', 'qq-official', 'inbound', 'group', 'group-1',
+                         'member-1', '图片',
+                         'https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc', 10)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version sixteen should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(column_exists(&connection, "messages", "media_requires_cache").unwrap());
+        let cache_only: i64 = connection
+            .query_row(
+                "SELECT media_requires_cache FROM messages WHERE event_key = 'legacy-media'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_only, 1);
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 16);
+        assert!(!column_exists(&backup, "messages", "media_requires_cache").unwrap());
     }
 
     #[test]

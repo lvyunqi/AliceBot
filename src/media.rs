@@ -115,12 +115,12 @@ pub(crate) async fn fetch_image_data(raw: &str, timeout_ms: u64) -> Option<(Stri
     {
         return None;
     }
-    let content_type = response
+    let content_type_hint = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(normalize_image_content_type)
-        .or_else(|| infer_image_content_type(raw))?;
+        .or_else(|| infer_image_content_type(raw));
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.ok()? {
         if bytes.len().saturating_add(chunk.len()) > MAX_VISION_IMAGE_BYTES {
@@ -130,6 +130,15 @@ pub(crate) async fn fetch_image_data(raw: &str, timeout_ms: u64) -> Option<(Stri
     }
     if bytes.is_empty() {
         return None;
+    }
+    // QQ temporary download endpoints usually have no filename extension and
+    // may use a generic content type. Verify the bytes themselves so an error
+    // page is never encoded as an image content block.
+    let content_type = image_content_type_from_bytes(&bytes)?;
+    if content_type_hint.is_some_and(|hint| hint != content_type) {
+        log::debug!(
+            "[AliceBot] downloaded image content type differed from its transport hint; using byte-detected type"
+        );
     }
     Some((
         content_type.to_string(),
@@ -158,6 +167,20 @@ fn infer_image_content_type(raw: &str) -> Option<&'static str> {
         Some("image/webp")
     } else if path.ends_with(".gif") {
         Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn image_content_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
     } else {
         None
     }
@@ -260,5 +283,26 @@ mod tests {
             media.storage_url,
             "https://example.test/a.png?size=large&format=png"
         );
+    }
+
+    #[test]
+    fn image_type_is_verified_from_downloaded_bytes() {
+        assert_eq!(
+            image_content_type_from_bytes(&[0xff, 0xd8, 0xff, 0xe0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_content_type_from_bytes(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_content_type_from_bytes(b"GIF89aimage-data"),
+            Some("image/gif")
+        );
+        assert_eq!(
+            image_content_type_from_bytes(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some("image/webp")
+        );
+        assert_eq!(image_content_type_from_bytes(b"<html>error</html>"), None);
     }
 }
