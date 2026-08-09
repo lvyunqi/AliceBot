@@ -6,3 +6,4 @@ pub(crate) mod cache;
 pub mod collect;
 pub mod link;
 pub mod send;
+pub(crate) mod status;

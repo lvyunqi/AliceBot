@@ -441,7 +441,7 @@
         "auto_collect": {
           "type": "boolean",
           "title": "自动收藏",
-          "description": "遇到合适图片时自动收藏为表情包",
+          "description": "合规图片会自动收藏为表情包；敏感内容、每日上限和安全校验仍会拦截",
           "default": true
         },
         "daily_collect_limit": {
@@ -485,10 +485,10 @@
         "collect_probability": {
           "type": "number",
           "title": "收藏概率",
-          "description": "见图时触发收藏的概率 0-1",
+          "description": "合规图片触发收藏的概率 0-1；默认 1 表示不随机漏收",
           "minimum": 0,
           "maximum": 1,
-          "default": 0.3
+          "default": 1
         },
         "send_probability": {
           "type": "number",

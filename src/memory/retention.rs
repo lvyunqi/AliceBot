@@ -117,6 +117,20 @@ mod tests {
             )
             .unwrap();
 
+        database
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO sticker_collection_events
+                 (source_event_key, media_index, protocol, session_type, session_id,
+                  source_user, url_hash, outcome, created_at)
+                 VALUES ('unreferenced', 0, 'onebot11', 'group', 'retention-group',
+                         'retention-user', 'hash-only', 'collected', ?1)",
+                rusqlite::params![now - 40 * DAY],
+            )
+            .unwrap();
+
         let report = apply_in(&database, true, 7, 30, now).unwrap();
         assert_eq!(
             report,
@@ -170,6 +184,15 @@ mod tests {
             )
             .unwrap();
         assert!(fresh_raw.is_some());
+
+        let retained_collection_events: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sticker_collection_events",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retained_collection_events, 0);
     }
 
     #[test]

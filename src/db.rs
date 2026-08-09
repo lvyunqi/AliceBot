@@ -186,6 +186,12 @@ impl Database {
                AND (?2 = 0 OR created_at < ?3)",
             params![now, i32::from(store_raw_events), raw_cutoff],
         )?;
+        // Collection status is only queried for recent images, so retain its
+        // scoped metadata no longer than the corresponding message journal.
+        transaction.execute(
+            "DELETE FROM sticker_collection_events WHERE created_at < ?1",
+            params![message_cutoff],
+        )?;
         let messages_deleted = transaction.execute(
             "DELETE FROM messages AS message
              WHERE message.direction = 'inbound'
