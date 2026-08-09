@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 17;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 18;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -133,6 +133,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         15 => migration_15_sticker_cache(transaction)?,
         16 => migration_16_sticker_graph(transaction)?,
         17 => migration_17_media_history_availability(transaction)?,
+        18 => migration_18_sticker_collection_events(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -1048,6 +1049,36 @@ fn migration_17_media_history_availability(conn: &Connection) -> Result<(), rusq
     Ok(())
 }
 
+/// Persist the outcome of every inbound image collection attempt without
+/// retaining the media URL. This makes status replies factual after the
+/// asynchronous cache worker has changed the sticker's live cache state.
+fn migration_18_sticker_collection_events(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS sticker_collection_events (
+            source_event_key TEXT NOT NULL,
+            media_index      INTEGER NOT NULL,
+            protocol         TEXT NOT NULL,
+            session_type     TEXT NOT NULL,
+            session_id       TEXT NOT NULL,
+            source_user      TEXT NOT NULL,
+            url_hash         TEXT NOT NULL,
+            outcome          TEXT NOT NULL,
+            sticker_id       INTEGER,
+            created_at       INTEGER NOT NULL,
+            PRIMARY KEY (source_event_key, media_index),
+            FOREIGN KEY (sticker_id) REFERENCES stickers(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sticker_collection_lookup_v18
+            ON sticker_collection_events
+               (protocol, session_type, session_id, source_user, created_at DESC, media_index DESC);
+        CREATE INDEX IF NOT EXISTS idx_sticker_collection_sticker_v18
+            ON sticker_collection_events(sticker_id, created_at DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn sanitize_media_url_column(conn: &Connection, table: &str) -> Result<(), rusqlite::Error> {
     let rows = {
         let mut statement = conn.prepare(&format!(
@@ -1257,6 +1288,21 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "first_seen",
                 "last_seen",
                 "seen_count",
+            ][..],
+        ),
+        (
+            "sticker_collection_events",
+            &[
+                "source_event_key",
+                "media_index",
+                "protocol",
+                "session_type",
+                "session_id",
+                "source_user",
+                "url_hash",
+                "outcome",
+                "sticker_id",
+                "created_at",
             ][..],
         ),
         (
@@ -2192,6 +2238,40 @@ mod tests {
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(read_schema_version(&backup).unwrap(), 16);
         assert!(!column_exists(&backup, "messages", "media_requires_cache").unwrap());
+    }
+
+    #[test]
+    fn version_seventeen_database_gains_collection_event_audit() {
+        let temporary = TempDatabase::new("version-seventeen");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 17).unwrap();
+        drop(connection);
+
+        let database =
+            Database::open(temporary.as_str()).expect("version seventeen should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(object_exists(&connection, "table", "sticker_collection_events").unwrap());
+        for column in [
+            "source_event_key",
+            "media_index",
+            "source_user",
+            "url_hash",
+            "outcome",
+            "sticker_id",
+        ] {
+            assert!(
+                column_exists(&connection, "sticker_collection_events", column).unwrap(),
+                "missing collection event column: {column}"
+            );
+        }
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 17);
+        assert!(!object_exists(&backup, "table", "sticker_collection_events").unwrap());
     }
 
     #[test]

@@ -565,7 +565,7 @@ pub struct StickerConfig {
 }
 
 fn default_collect_prob() -> f32 {
-    0.3
+    1.0
 }
 fn default_daily_collect_limit() -> u32 {
     100
@@ -1024,6 +1024,7 @@ mod tests {
     fn sticker_cache_limits_default_safely_and_reject_invalid_ranges() {
         let defaults = AppConfig::default().stickers;
         assert!(defaults.cache_media);
+        assert_eq!(defaults.collect_probability, 1.0);
         assert_eq!(defaults.daily_collect_limit, 100);
         assert_eq!(defaults.cache_max_file_mib, 8);
         assert_eq!(defaults.cache_max_total_mib, 256);

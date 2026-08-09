@@ -4,9 +4,13 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
+use crate::db::Database;
 use crate::stickers::cache::{CachePolicy, CacheTask};
 
-const COLLECTION_SCORE_THRESHOLD: f32 = 0.45;
+// A plain image has a baseline score of 0.40. Do not silently discard it just
+// because it arrived without a caption; sensitivity and resource safeguards
+// still apply before it can be persisted.
+const COLLECTION_SCORE_THRESHOLD: f32 = 0.40;
 const DEFAULT_DAILY_COLLECT_LIMIT: u32 = 100;
 const DAY_MILLIS: i64 = 86_400_000;
 
@@ -21,22 +25,68 @@ pub(crate) struct CollectionPolicy {
     pub(crate) cache: Option<(CachePolicy, PathBuf)>,
 }
 
+/// The reason a collection attempt was not written. These stable categories
+/// are persisted for factual status replies, never the original media URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectionSkipReason {
+    InvalidMedia,
+    Sensitive,
+    Sampling,
+    DailyLimit,
+    LowSignal,
+    DatabaseUnavailable,
+    DatabaseFailure,
+}
+
+/// A collection attempt must not collapse all failures into `None`: callers
+/// need to record why a user-visible image was or was not collected.
+pub(crate) enum CollectionResult {
+    Collected(CollectedSticker),
+    Skipped(CollectionSkipReason),
+}
+
+impl CollectionResult {
+    pub(crate) fn outcome_code(&self) -> &'static str {
+        match self {
+            Self::Collected(_) => "collected",
+            Self::Skipped(CollectionSkipReason::InvalidMedia) => "skipped_invalid_media",
+            Self::Skipped(CollectionSkipReason::Sensitive) => "skipped_sensitive",
+            Self::Skipped(CollectionSkipReason::Sampling) => "skipped_sampling",
+            Self::Skipped(CollectionSkipReason::DailyLimit) => "skipped_daily_limit",
+            Self::Skipped(CollectionSkipReason::LowSignal) => "skipped_low_signal",
+            Self::Skipped(CollectionSkipReason::DatabaseUnavailable) => {
+                "skipped_database_unavailable"
+            }
+            Self::Skipped(CollectionSkipReason::DatabaseFailure) => "skipped_database_failure",
+        }
+    }
+
+    pub(crate) fn sticker_id(&self) -> Option<i64> {
+        match self {
+            Self::Collected(collected) => Some(collected.sticker_id),
+            Self::Skipped(_) => None,
+        }
+    }
+}
+
 /// Compatibility entry point for callers without policy metadata.
 pub async fn maybe_collect(image_url: &str, context: &str) -> bool {
-    maybe_collect_with_metadata(
-        image_url,
-        context,
-        "unknown",
-        "",
-        "",
-        CollectionPolicy {
-            probability: 1.0,
-            daily_collect_limit: DEFAULT_DAILY_COLLECT_LIMIT,
-            cache: None,
-        },
+    matches!(
+        maybe_collect_with_metadata(
+            image_url,
+            context,
+            "unknown",
+            "",
+            "",
+            CollectionPolicy {
+                probability: 1.0,
+                daily_collect_limit: DEFAULT_DAILY_COLLECT_LIMIT,
+                cache: None,
+            },
+        )
+        .await,
+        CollectionResult::Collected(_)
     )
-    .await
-    .is_some()
 }
 
 /// Apply deterministic sampling, scoring and a daily bound before writing a sticker.
@@ -47,128 +97,40 @@ pub(crate) async fn maybe_collect_with_metadata(
     source_user: &str,
     source_session: &str,
     policy: CollectionPolicy,
-) -> Option<CollectedSticker> {
-    let media = crate::media::sanitize_remote_media_url(image_url, true)?;
+) -> CollectionResult {
+    let Some(media) = crate::media::sanitize_remote_media_url(image_url, true) else {
+        return CollectionResult::Skipped(CollectionSkipReason::InvalidMedia);
+    };
     if is_sensitive_context(context) {
-        return None;
+        return CollectionResult::Skipped(CollectionSkipReason::Sensitive);
     }
     if policy.probability <= 0.0 {
-        return None;
+        return CollectionResult::Skipped(CollectionSkipReason::Sampling);
     }
     if policy.probability < 1.0
         && deterministic_sample(&media.identity_hash) >= policy.probability.clamp(0.0, 1.0)
     {
-        return None;
+        return CollectionResult::Skipped(CollectionSkipReason::Sampling);
     }
 
-    let database = crate::pipeline::try_db()?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let requires_cache = i32::from(media.requires_cache);
-    let cache_status = if media.requires_cache {
-        "required"
-    } else {
-        "remote"
+    let Some(database) = crate::pipeline::try_db() else {
+        return CollectionResult::Skipped(CollectionSkipReason::DatabaseUnavailable);
     };
-    let sticker_id = {
-        let mut connection = database.conn.lock().ok()?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .ok()?;
-        let existing = transaction
-            .query_row(
-                "SELECT s.id FROM stickers AS s
-                 LEFT JOIN sticker_sources AS source ON source.sticker_id = s.id
-                 WHERE s.url_hash = ?1 OR source.url_hash = ?1
-                 ORDER BY s.id LIMIT 1",
-                rusqlite::params![media.identity_hash],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .ok()?;
-
-        if existing.is_none() {
-            let score = collection_score(context, false, true);
-            if !daily_collection_has_capacity(&transaction, now, policy.daily_collect_limit).ok()?
-                || score < COLLECTION_SCORE_THRESHOLD
-            {
-                transaction.commit().ok()?;
-                return None;
-            }
-        }
-
-        let sticker_id = if let Some(id) = existing {
-            transaction
-                .execute(
-                    "UPDATE stickers
-                     SET usage_count = usage_count + 1, last_used = ?1, updated_at = ?1,
-                         media_url = CASE
-                             WHEN url_requires_cache = 1 AND ?2 = 0 THEN ?3
-                             ELSE media_url
-                         END,
-                         url_requires_cache = MIN(url_requires_cache, ?2),
-                         cache_status = CASE
-                             WHEN ?2 = 0 AND cache_status NOT IN ('cached', 'caching', 'queued')
-                                 THEN 'remote'
-                             ELSE cache_status
-                         END
-                     WHERE id = ?4",
-                    rusqlite::params![now, requires_cache, media.storage_url, id],
-                )
-                .ok()?;
-            id
-        } else {
-            transaction
-                .execute(
-                    "INSERT INTO stickers
-                     (protocol, kind, media_url, url_hash, url_requires_cache, cache_status,
-                      source_user, source_session, usage_count, last_used, created_at, updated_at)
-                     VALUES (?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?8)",
-                    rusqlite::params![
-                        protocol,
-                        media.storage_url,
-                        media.identity_hash,
-                        requires_cache,
-                        cache_status,
-                        source_user,
-                        source_session,
-                        now
-                    ],
-                )
-                .ok()?;
-            transaction.last_insert_rowid()
-        };
-
-        transaction
-            .execute(
-                "INSERT INTO sticker_sources
-                     (sticker_id, url_hash, protocol, source_user, source_session,
-                      first_seen, last_seen, seen_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
-                 ON CONFLICT(sticker_id, url_hash) DO UPDATE SET
-                    last_seen = MAX(sticker_sources.last_seen, excluded.last_seen),
-                    seen_count = sticker_sources.seen_count + 1",
-                rusqlite::params![
-                    sticker_id,
-                    media.identity_hash,
-                    protocol,
-                    source_user,
-                    source_session,
-                    now
-                ],
-            )
-            .ok()?;
-
-        for tag in tags_from_context(context) {
-            transaction
-                .execute(
-                    "INSERT INTO sticker_tags (sticker_id, tag, weight) VALUES (?1, ?2, 1)
-                     ON CONFLICT(sticker_id, tag) DO UPDATE SET weight = weight + 1",
-                    rusqlite::params![sticker_id, tag],
-                )
-                .ok()?;
-        }
-        transaction.commit().ok()?;
-        sticker_id
+    let now = chrono::Utc::now().timestamp_millis();
+    let sticker_id = match collect_in_database(
+        &database,
+        &media.identity_hash,
+        &media.storage_url,
+        media.requires_cache,
+        context,
+        protocol,
+        source_user,
+        source_session,
+        policy.daily_collect_limit,
+        now,
+    ) {
+        Ok(sticker_id) => sticker_id,
+        Err(reason) => return CollectionResult::Skipped(reason),
     };
 
     let cache_task = policy.cache.and_then(|(cache_policy, cache_root)| {
@@ -180,10 +142,137 @@ pub(crate) async fn maybe_collect_with_metadata(
             cache_policy,
         )
     });
-    Some(CollectedSticker {
+    CollectionResult::Collected(CollectedSticker {
         sticker_id,
         cache_task,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_in_database(
+    database: &Database,
+    url_hash: &str,
+    storage_url: &str,
+    requires_cache: bool,
+    context: &str,
+    protocol: &str,
+    source_user: &str,
+    source_session: &str,
+    daily_collect_limit: u32,
+    now: i64,
+) -> Result<i64, CollectionSkipReason> {
+    let mut connection = database
+        .conn
+        .lock()
+        .map_err(|_| CollectionSkipReason::DatabaseUnavailable)?;
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+    let existing = transaction
+        .query_row(
+            "SELECT s.id FROM stickers AS s
+             LEFT JOIN sticker_sources AS source ON source.sticker_id = s.id
+             WHERE s.url_hash = ?1 OR source.url_hash = ?1
+             ORDER BY s.id LIMIT 1",
+            rusqlite::params![url_hash],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+
+    if existing.is_none() {
+        if !daily_collection_has_capacity(&transaction, now, daily_collect_limit)
+            .map_err(|_| CollectionSkipReason::DatabaseFailure)?
+        {
+            return Err(CollectionSkipReason::DailyLimit);
+        }
+        let score = collection_score(context, false, true);
+        if score + f32::EPSILON < COLLECTION_SCORE_THRESHOLD {
+            return Err(CollectionSkipReason::LowSignal);
+        }
+    }
+
+    let requires_cache = i32::from(requires_cache);
+    let cache_status = if requires_cache != 0 {
+        "required"
+    } else {
+        "remote"
+    };
+    let sticker_id = if let Some(id) = existing {
+        transaction
+            .execute(
+                "UPDATE stickers
+                 SET usage_count = usage_count + 1, last_used = ?1, updated_at = ?1,
+                     media_url = CASE
+                         WHEN url_requires_cache = 1 AND ?2 = 0 THEN ?3
+                         ELSE media_url
+                     END,
+                     url_requires_cache = MIN(url_requires_cache, ?2),
+                     cache_status = CASE
+                         WHEN ?2 = 0 AND cache_status NOT IN ('cached', 'caching', 'queued')
+                             THEN 'remote'
+                         ELSE cache_status
+                     END
+                 WHERE id = ?4",
+                rusqlite::params![now, requires_cache, storage_url, id],
+            )
+            .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+        id
+    } else {
+        transaction
+            .execute(
+                "INSERT INTO stickers
+                 (protocol, kind, media_url, url_hash, url_requires_cache, cache_status,
+                  source_user, source_session, usage_count, last_used, created_at, updated_at)
+                 VALUES (?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8, ?8)",
+                rusqlite::params![
+                    protocol,
+                    storage_url,
+                    url_hash,
+                    requires_cache,
+                    cache_status,
+                    source_user,
+                    source_session,
+                    now
+                ],
+            )
+            .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+        transaction.last_insert_rowid()
+    };
+
+    transaction
+        .execute(
+            "INSERT INTO sticker_sources
+                 (sticker_id, url_hash, protocol, source_user, source_session,
+                  first_seen, last_seen, seen_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1)
+             ON CONFLICT(sticker_id, url_hash) DO UPDATE SET
+                last_seen = MAX(sticker_sources.last_seen, excluded.last_seen),
+                seen_count = sticker_sources.seen_count + 1",
+            rusqlite::params![
+                sticker_id,
+                url_hash,
+                protocol,
+                source_user,
+                source_session,
+                now
+            ],
+        )
+        .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+
+    for tag in tags_from_context(context) {
+        transaction
+            .execute(
+                "INSERT INTO sticker_tags (sticker_id, tag, weight) VALUES (?1, ?2, 1)
+                 ON CONFLICT(sticker_id, tag) DO UPDATE SET weight = weight + 1",
+                rusqlite::params![sticker_id, tag],
+            )
+            .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| CollectionSkipReason::DatabaseFailure)?;
+    Ok(sticker_id)
 }
 
 fn daily_collection_has_capacity(
@@ -399,7 +488,7 @@ mod tests {
         let low_signal_score = collection_score("", false, true);
         assert!(new_score > duplicate_score);
         assert!(new_score > unsupported_score);
-        assert!(low_signal_score < COLLECTION_SCORE_THRESHOLD);
+        assert!(low_signal_score + f32::EPSILON >= COLLECTION_SCORE_THRESHOLD);
         assert!(new_score >= COLLECTION_SCORE_THRESHOLD);
         assert!((0.0..=1.0).contains(&new_score));
     }
