@@ -30,15 +30,13 @@ pub(crate) struct StickerCandidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UrlImageCapability {
     Supported,
-    Unverified,
     Unsupported,
 }
 
-/// 宿主仅支持 URL 图片发送时的平台能力矩阵；本地文件上传仍待验证。
+/// 宿主已验证的 HTTPS URL 图片发送能力矩阵。
 pub(crate) fn url_image_capability(protocol: &str) -> UrlImageCapability {
     match protocol {
-        "onebot11" => UrlImageCapability::Supported,
-        "qq-official" => UrlImageCapability::Unverified,
+        "onebot11" | "qq-official" => UrlImageCapability::Supported,
         _ => UrlImageCapability::Unsupported,
     }
 }
@@ -365,14 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn capability_matrix_blocks_unverified_url_media_routes() {
+    fn capability_matrix_allows_verified_url_media_routes() {
         assert_eq!(
             url_image_capability("onebot11"),
             UrlImageCapability::Supported
         );
         assert_eq!(
             url_image_capability("qq-official"),
-            UrlImageCapability::Unverified
+            UrlImageCapability::Supported
         );
         assert_eq!(
             url_image_capability("unknown"),
