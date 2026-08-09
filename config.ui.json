@@ -16,7 +16,7 @@
       },
       "speaking_style": {
         "ui:widget": "textarea",
-        "ui:placeholder": "如：口语化，爱用表情词"
+        "ui:placeholder": "如：简短口语化，直接回答，不堆表情或语气词"
       }
     },
     "llm": {
