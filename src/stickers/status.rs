@@ -199,6 +199,37 @@ pub(crate) fn sticker_status_tool(current: &InMessage) -> Value {
     })
 }
 
+/// Confirm whether this exact media identity already belongs to the current
+/// protocol's sticker library. This never returns the URL or internal ID.
+pub(crate) fn media_is_collected(protocol: &str, media: &MediaRef) -> bool {
+    let Some(database) = crate::pipeline::try_db() else {
+        return false;
+    };
+    media_is_collected_in_database(&database, protocol, media)
+}
+
+fn media_is_collected_in_database(database: &Database, protocol: &str, media: &MediaRef) -> bool {
+    let url_hash = media_identity_hash(&media.url);
+    let Ok(connection) = database.conn.lock() else {
+        return false;
+    };
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM stickers AS sticker
+                 LEFT JOIN sticker_sources AS source ON source.sticker_id = sticker.id
+                 WHERE sticker.protocol = ?1
+                   AND (sticker.url_hash = ?2 OR source.url_hash = ?2)
+                   AND sticker.cache_status <> 'invalid'
+             )",
+            params![protocol, url_hash],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|exists| exists != 0)
+        .unwrap_or(false)
+}
+
 /// Execute the read-only native tool for a small, redacted sticker search.
 pub(crate) fn search_stickers_tool(arguments: &Value, current: &InMessage) -> Value {
     let query = arguments
@@ -398,6 +429,7 @@ mod tests {
         let media = MediaRef {
             url: "https://example.test/one.png".to_string(),
             media_type: "image/png".to_string(),
+            requires_cache: false,
         };
         let first = message("member-1", "group-1");
         let now = chrono::Utc::now().timestamp_millis();
@@ -454,5 +486,36 @@ mod tests {
         assert!(!rendered.contains("example.test"));
         assert!(!rendered.contains("token"));
         assert!(rendered.contains("image"));
+    }
+
+    #[test]
+    fn exact_media_identity_confirms_existing_collection_without_exposing_url() {
+        let database = Database::open(":memory:").unwrap();
+        let media = MediaRef {
+            url: "https://example.test/collected.png".to_string(),
+            media_type: "image/png".to_string(),
+            requires_cache: false,
+        };
+        let hash = media_identity_hash(&media.url);
+        database
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO stickers
+                 (protocol, media_url, url_hash, url_requires_cache, cache_status,
+                  source_session, created_at, updated_at)
+                 VALUES ('onebot11', ?1, ?2, 0, 'remote', 'group-1', 1, 1)",
+                params![media.url, hash],
+            )
+            .unwrap();
+        assert!(media_is_collected_in_database(
+            &database, "onebot11", &media
+        ));
+        assert!(!media_is_collected_in_database(
+            &database,
+            "qq-official",
+            &media
+        ));
     }
 }

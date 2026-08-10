@@ -2,7 +2,7 @@ use rusqlite::{Connection, DatabaseName, OptionalExtension, Transaction, Transac
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub(crate) const LATEST_SCHEMA_VERSION: i64 = 18;
+pub(crate) const LATEST_SCHEMA_VERSION: i64 = 19;
 pub(crate) const MEMORY_SEARCH_CACHE_CONTRACT: &str = "fts5-external-content-v1";
 
 #[derive(Debug, thiserror::Error)]
@@ -134,6 +134,7 @@ fn apply_migration(transaction: &Transaction<'_>, version: i64) -> Result<(), Da
         16 => migration_16_sticker_graph(transaction)?,
         17 => migration_17_media_history_availability(transaction)?,
         18 => migration_18_sticker_collection_events(transaction)?,
+        19 => migration_19_agent_actions_and_message_references(transaction)?,
         _ => return Err(DatabaseError::MissingMigration(version)),
     }
     Ok(())
@@ -1079,6 +1080,43 @@ fn migration_18_sticker_collection_events(conn: &Connection) -> Result<(), rusql
     Ok(())
 }
 
+/// Link protocol-native quote references to historical messages and keep a
+/// redacted audit of native tool execution. Arguments and tool results are
+/// intentionally excluded from this table.
+fn migration_19_agent_actions_and_message_references(
+    conn: &Connection,
+) -> Result<(), rusqlite::Error> {
+    ensure_column(
+        conn,
+        "messages",
+        "message_ref_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute_batch(
+        r#"
+        UPDATE messages
+        SET message_ref_id = COALESCE(NULLIF(message_id, ''), '')
+        WHERE message_ref_id = '';
+
+        CREATE TABLE IF NOT EXISTS agent_tool_calls (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_event_key TEXT NOT NULL,
+            protocol         TEXT NOT NULL,
+            session_type     TEXT NOT NULL,
+            session_id       TEXT NOT NULL,
+            tool_name        TEXT NOT NULL,
+            outcome          TEXT NOT NULL,
+            created_at       INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_ref_route_v19
+            ON messages(protocol, session_type, session_id, message_ref_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_agent_tool_calls_status_time_v19
+            ON agent_tool_calls(outcome, created_at DESC, id DESC);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn sanitize_media_url_column(conn: &Connection, table: &str) -> Result<(), rusqlite::Error> {
     let rows = {
         let mut statement = conn.prepare(&format!(
@@ -1130,6 +1168,7 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
                 "content",
                 "media_url",
                 "media_requires_cache",
+                "message_ref_id",
                 "processing_status",
                 "processing_error",
                 "processed_at",
@@ -1306,6 +1345,18 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
             ][..],
         ),
         (
+            "agent_tool_calls",
+            &[
+                "source_event_key",
+                "protocol",
+                "session_type",
+                "session_id",
+                "tool_name",
+                "outcome",
+                "created_at",
+            ][..],
+        ),
+        (
             "reflection_log",
             &["triggered_by", "insights", "created_at"][..],
         ),
@@ -1365,6 +1416,8 @@ fn validate_latest_schema(conn: &Connection) -> Result<(), DatabaseError> {
         "idx_sticker_sources_url_hash_v15",
         "idx_stickers_file_hash_v15",
         "idx_stickers_cache_status_v15",
+        "idx_messages_ref_route_v19",
+        "idx_agent_tool_calls_status_time_v19",
         "ux_knowledge_key_version",
         "idx_persona_subject_protocol",
         "idx_persona_observation_subject",
@@ -2272,6 +2325,47 @@ mod tests {
         let backup = Connection::open(&backups[0]).unwrap();
         assert_eq!(read_schema_version(&backup).unwrap(), 17);
         assert!(!object_exists(&backup, "table", "sticker_collection_events").unwrap());
+    }
+
+    #[test]
+    fn version_eighteen_database_gains_message_references_and_agent_audit() {
+        let temporary = TempDatabase::new("version-eighteen");
+        let mut connection = Connection::open(&temporary.path).unwrap();
+        migrate_to(&mut connection, 18).unwrap();
+        connection
+            .execute(
+                "INSERT INTO messages
+                 (event_key, protocol, direction, session_type, session_id, sender_id,
+                  message_id, content, created_at)
+                 VALUES ('message-ref', 'onebot11', 'inbound', 'group', 'group-1',
+                         'member-1', 'legacy-message-id', 'hello', 10)",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        let database = Database::open(temporary.as_str()).expect("version eighteen should migrate");
+        let connection = database.conn.lock().unwrap();
+        assert!(column_exists(&connection, "messages", "message_ref_id").unwrap());
+        assert!(object_exists(&connection, "table", "agent_tool_calls").unwrap());
+        assert!(object_exists(&connection, "index", "idx_messages_ref_route_v19").unwrap());
+        let backfilled: String = connection
+            .query_row(
+                "SELECT message_ref_id FROM messages WHERE event_key = 'message-ref'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(backfilled, "legacy-message-id");
+        drop(connection);
+        drop(database);
+
+        let backups = temporary.backups();
+        assert_eq!(backups.len(), 1);
+        let backup = Connection::open(&backups[0]).unwrap();
+        assert_eq!(read_schema_version(&backup).unwrap(), 18);
+        assert!(!column_exists(&backup, "messages", "message_ref_id").unwrap());
+        assert!(!object_exists(&backup, "table", "agent_tool_calls").unwrap());
     }
 
     #[test]

@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "alicebot"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "abi-stable-host-api",
  "abi_stable",

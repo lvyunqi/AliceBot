@@ -94,7 +94,9 @@ pub(crate) fn assemble(input: ContextInput<'_>) -> PromptAssembly {
         if !item.event_key.is_empty() && excluded.contains(item.event_key.as_str()) {
             continue;
         }
-        let Some(candidate) = history_message(item) else {
+        let is_referenced = !input.current.reply_to_id.is_empty()
+            && item.message_ref_id == input.current.reply_to_id;
+        let Some(candidate) = history_message(item, is_referenced) else {
             continue;
         };
         let cost = message_token_cost(&candidate);
@@ -178,7 +180,7 @@ fn reserved_history_budget(
     desired.min(room_after_current_and_core)
 }
 
-fn history_message(item: &ContextMessage) -> Option<ChatMessage> {
+fn history_message(item: &ContextMessage, is_referenced: bool) -> Option<ChatMessage> {
     if item.content.trim().is_empty() {
         return None;
     }
@@ -192,6 +194,9 @@ fn history_message(item: &ContextMessage) -> Option<ChatMessage> {
     }?;
     if !item.media.is_empty() {
         message.content.push_str("\n[该历史消息含图片或表情附件]");
+    }
+    if is_referenced {
+        message.content.push_str("\n[当前消息正在引用这条历史消息]");
     }
     Some(message)
 }
@@ -360,6 +365,7 @@ mod tests {
     fn history(event_key: &str, role: &str, speaker: &str, content: &str) -> ContextMessage {
         ContextMessage {
             event_key: event_key.to_string(),
+            message_ref_id: event_key.to_string(),
             role: role.to_string(),
             content: content.to_string(),
             speaker: speaker.to_string(),
@@ -527,6 +533,7 @@ mod tests {
         let current = message("current", "普通聊天");
         let history = vec![ContextMessage {
             event_key: "image-event".to_string(),
+            message_ref_id: "image-reference".to_string(),
             role: "user".to_string(),
             content: "上一条图片".to_string(),
             speaker: "听雨#abc123".to_string(),
@@ -535,6 +542,7 @@ mod tests {
             media: vec![crate::pipeline::MediaRef {
                 url: "https://example.test/image.png".to_string(),
                 media_type: "image/png".to_string(),
+                requires_cache: false,
             }],
         }];
 
@@ -585,5 +593,39 @@ mod tests {
                 .content
                 .contains("被引用消息的作者不是当前发言者")
         );
+    }
+
+    #[test]
+    fn quoted_history_message_is_marked_without_changing_the_current_speaker() {
+        let mut current = message("current", "这张图什么意思");
+        current.reply_to_id = "quoted-reference".to_string();
+        let history = vec![ContextMessage {
+            event_key: "quoted-event".to_string(),
+            message_ref_id: "quoted-reference".to_string(),
+            role: "user".to_string(),
+            content: "被引用的内容".to_string(),
+            speaker: "历史成员#abcdef".to_string(),
+            timestamp: 1,
+            is_key: false,
+            media: Vec::new(),
+        }];
+        let assembled = assemble(ContextInput {
+            base_system: "核心人设",
+            profile: None,
+            long_memories: &[],
+            history: &history,
+            current: &current,
+            current_content: &current.content,
+            source_event_keys: &["current".to_string()],
+            configured_budget: 512,
+        });
+        let joined = assembled
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("当前消息正在引用这条历史消息"));
+        assert!(joined.contains("[当前发言者: 当前用户#"));
     }
 }

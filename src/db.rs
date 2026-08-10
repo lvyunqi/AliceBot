@@ -129,17 +129,17 @@ impl Database {
             .media
             .first()
             .map(|media| crate::media::redact_url_for_storage(&media.url));
-        let media_requires_cache = msg.media.first().is_some_and(|media| {
-            crate::media::sanitize_remote_media_url(&media.url, false)
-                .is_some_and(|media| media.requires_cache)
-        });
+        let media_requires_cache = msg.media.first().is_some_and(|media| media.requires_cache);
         let raw_json = store_raw_events.then_some(msg.safe_raw_json.as_str());
+        let message_ref_id = crate::pipeline::message_reference_id(msg);
         let changed = conn.execute(
             "INSERT OR IGNORE INTO messages
              (event_key, protocol, bot_account_id, direction, session_type, session_id, sender_id,
               sender_name, message_id, content, raw_json, has_media, media_type,
-              media_url, media_requires_cache, reply_to_id, at_me, processing_status, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 'recorded', ?17, ?17)",
+              media_url, media_requires_cache, message_ref_id, reply_to_id, at_me,
+              processing_status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'inbound', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                     ?13, ?14, ?15, ?16, ?17, 'recorded', ?18, ?18)",
             params![
                 msg.event_key,
                 msg.protocol,
@@ -155,6 +155,7 @@ impl Database {
                 media_type,
                 media_url,
                 media_requires_cache as i32,
+                message_ref_id,
                 msg.reply_to_id,
                 msg.at_me as i32,
                 msg.timestamp,
@@ -342,6 +343,35 @@ impl Database {
                 error.map(truncate_for_storage),
                 now,
                 id
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Persist only the name and coarse outcome of one native Agent tool.
+    /// Tool arguments, results, message text, and media references are never
+    /// written to this audit table.
+    pub fn record_agent_tool_call(
+        &self,
+        message: &crate::pipeline::InMessage,
+        tool_name: &str,
+        outcome: &str,
+        now: i64,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_tool_calls
+             (source_event_key, protocol, session_type, session_id,
+              tool_name, outcome, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                message.event_key,
+                message.protocol,
+                message.session_type,
+                message.session_id,
+                truncate_for_storage(tool_name),
+                truncate_for_storage(outcome),
+                now,
             ],
         )?;
         Ok(())
@@ -594,6 +624,7 @@ mod tests {
             url: "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=temporary&spec=0"
                 .to_string(),
             media_type: "image/jpeg".to_string(),
+            requires_cache: true,
         }];
 
         assert!(
@@ -617,6 +648,50 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn message_references_and_agent_tool_audit_are_redacted_and_queryable() {
+        let database = Database::open(":memory:").expect("database should open");
+        let mut message = test_message("qq-official:message-reference");
+        message.safe_raw_json = serde_json::json!({
+            "d": {"message_scene": {"ext": ["msg_idx=REFIDX_current"]}}
+        })
+        .to_string();
+        assert!(database.insert_message(&message).unwrap());
+        database
+            .record_agent_tool_call(
+                &message,
+                "collect_recent_image",
+                "success",
+                message.timestamp,
+            )
+            .unwrap();
+
+        let connection = database.conn.lock().unwrap();
+        let message_ref_id: String = connection
+            .query_row(
+                "SELECT message_ref_id FROM messages WHERE event_key = ?1",
+                params![message.event_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(message_ref_id, "REFIDX_current");
+        let audit: (String, String, String) = connection
+            .query_row(
+                "SELECT tool_name, outcome, source_event_key FROM agent_tool_calls LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            audit,
+            (
+                "collect_recent_image".to_string(),
+                "success".to_string(),
+                message.event_key
+            )
+        );
     }
 
     #[test]
