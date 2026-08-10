@@ -14,6 +14,8 @@ use crate::pipeline::InMessage;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextMessage {
     pub event_key: String,
+    /// Protocol-native message reference used to resolve QQ quote targets.
+    pub message_ref_id: String,
     pub role: String,
     pub content: String,
     pub speaker: String,
@@ -63,14 +65,13 @@ const MIN_MAX_MESSAGES: usize = 5;
 const MAX_MAX_MESSAGES: usize = 200;
 const RESTORE_LOOKBACK_MILLIS: i64 = 7 * 24 * 60 * 60 * 1_000;
 const RESTORE_ROUTE_SCAN_MULTIPLIER: usize = 16;
-const UNAVAILABLE_RESTORED_MEDIA_URL: &str = "[temporary-media-unavailable-after-restart]";
-
 /// 推入用户消息。
 pub async fn push(msg: &InMessage) {
     push_message(
         &scoped_session_key(&msg.protocol, &msg.session_type, &msg.session_id),
         ContextMessage {
             event_key: msg.event_key.clone(),
+            message_ref_id: crate::pipeline::message_reference_id(msg),
             role: "user".to_string(),
             content: context_content(&msg.content, &msg.media, msg.has_media),
             speaker: speaker_label(msg),
@@ -96,6 +97,7 @@ pub async fn push_assistant(
         &scoped_session_key(protocol, session_type, session_id),
         ContextMessage {
             event_key: String::new(),
+            message_ref_id: String::new(),
             role: "assistant".to_string(),
             content: content.trim().to_string(),
             speaker: String::new(),
@@ -294,7 +296,8 @@ pub(crate) fn restore_from_database(
 
         let mut inbound_statement = connection
             .prepare(
-                "SELECT id, COALESCE(event_key, ''), sender_id,
+                "SELECT id, COALESCE(event_key, ''),
+                        COALESCE(message_ref_id, ''), sender_id,
                         COALESCE(sender_name, ''), content, has_media,
                         COALESCE(media_type, ''), COALESCE(media_url, ''),
                         COALESCE(media_requires_cache, 1), created_at
@@ -338,11 +341,12 @@ pub(crate) fn restore_from_database(
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, String>(4)?,
-                            row.get::<_, i64>(5)? != 0,
-                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)? != 0,
                             row.get::<_, String>(7)?,
-                            row.get::<_, i64>(8)? != 0,
-                            row.get::<_, i64>(9)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, i64>(9)? != 0,
+                            row.get::<_, i64>(10)?,
                         ))
                     },
                 )
@@ -351,6 +355,7 @@ pub(crate) fn restore_from_database(
                 let (
                     source_id,
                     event_key,
+                    message_ref_id,
                     sender_id,
                     sender_name,
                     content,
@@ -371,6 +376,7 @@ pub(crate) fn restore_from_database(
                         } else {
                             event_key
                         },
+                        message_ref_id,
                         role: "user".to_string(),
                         content,
                         speaker: speaker_label_for(&route.protocol, &sender_id, &sender_name),
@@ -413,6 +419,7 @@ pub(crate) fn restore_from_database(
                         role: "assistant".to_string(),
                         content: content.to_string(),
                         speaker: String::new(),
+                        message_ref_id: String::new(),
                         timestamp,
                         is_key: false,
                         media: Vec::new(),
@@ -584,16 +591,13 @@ fn restored_media(
         return Vec::new();
     }
     vec![crate::pipeline::MediaRef {
-        url: if media_requires_cache {
-            UNAVAILABLE_RESTORED_MEDIA_URL.to_string()
-        } else {
-            media_url
-        },
+        url: media_url,
         media_type: if media_type.is_empty() {
             "image".to_string()
         } else {
             media_type
         },
+        requires_cache: media_requires_cache,
     }]
 }
 
@@ -700,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn restored_temporary_media_keeps_the_image_fact_without_a_dead_url() {
+    fn restored_temporary_media_keeps_cache_lookup_identity() {
         let media = restored_media(
             "image/jpeg".to_string(),
             "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc".to_string(),
@@ -708,7 +712,8 @@ mod tests {
         );
         assert_eq!(media.len(), 1);
         assert_eq!(media[0].media_type, "image/jpeg");
-        assert_eq!(media[0].url, UNAVAILABLE_RESTORED_MEDIA_URL);
+        assert!(media[0].url.contains("fileid=abc"));
+        assert!(media[0].requires_cache);
 
         let public_media = restored_media(
             "image/png".to_string(),
@@ -716,6 +721,7 @@ mod tests {
             false,
         );
         assert_eq!(public_media[0].url, "https://example.test/image.png");
+        assert!(!public_media[0].requires_cache);
     }
 
     #[allow(clippy::too_many_arguments)] // Test fixture mirrors the journal's route/state fields.

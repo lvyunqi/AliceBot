@@ -2,6 +2,7 @@
 
 use crate::db::Database;
 use crate::media::sanitize_remote_media_url;
+use base64::Engine;
 use reqwest::redirect::Policy;
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
@@ -192,6 +193,68 @@ pub(crate) fn queue_if_needed(
             policy,
         )
     })
+}
+
+/// Read a cached image for a redacted historical URL. The URL is only used to
+/// resolve the content hash; the returned bytes never leave the plugin except
+/// as the bounded multimodal request that asked for them.
+pub(crate) async fn cached_image_data_for_url(raw_url: &str) -> Option<(String, String)> {
+    let database = crate::pipeline::try_db()?;
+    let root = crate::pipeline::sticker_cache_root()?;
+    let path = cached_image_path_for_url(&database, &root, raw_url)?;
+    let metadata = tokio::fs::metadata(&path).await.ok()?;
+    if metadata.len() > crate::media::MAX_VISION_IMAGE_BYTES as u64 {
+        return None;
+    }
+    let bytes = tokio::fs::read(path).await.ok()?;
+    let media_type = crate::media::image_content_type_from_bytes(&bytes)?;
+    Some((
+        media_type.to_string(),
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
+}
+
+fn cached_image_path_for_url(
+    database: &Database,
+    cache_root: &std::path::Path,
+    raw_url: &str,
+) -> Option<std::path::PathBuf> {
+    let sanitized = sanitize_remote_media_url(raw_url, true)?;
+    let cache_path = {
+        let connection = database.conn.lock().ok()?;
+        connection
+            .query_row(
+                "SELECT sticker.cache_path
+                 FROM stickers AS sticker
+                 WHERE sticker.cache_status = 'cached'
+                   AND sticker.cache_path IS NOT NULL
+                   AND (sticker.url_hash = ?1 OR EXISTS (
+                       SELECT 1 FROM sticker_sources AS source
+                       WHERE source.sticker_id = sticker.id AND source.url_hash = ?1
+                   ))
+                 ORDER BY sticker.id ASC
+                 LIMIT 1",
+                rusqlite::params![sanitized.identity_hash],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    }?;
+    let relative = std::path::PathBuf::from(&cache_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    Some(cache_root.join(relative))
 }
 
 async fn download_to_temp(task: &CacheTask) -> Result<DownloadedFile, CacheError> {
@@ -839,6 +902,30 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(temporary_files.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redacted_historical_url_resolves_the_surviving_cache_file() {
+        let database = Arc::new(Database::open(":memory:").unwrap());
+        let root = temp_root("history-lookup");
+        let raw_url =
+            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc&rkey=temporary&spec=0";
+        let sanitized = sanitize_remote_media_url(raw_url, true).unwrap();
+        let id = add_sticker(&database, &sanitized.identity_hash, &sanitized.storage_url);
+        let task = CacheTask::new(
+            database.clone(),
+            id,
+            raw_url.to_string(),
+            root.clone(),
+            policy(1024, 4096),
+        );
+        let bytes = b"\x89PNG\r\n\x1a\nrestored-image";
+        cache_bytes_for_test(&task, bytes).await.unwrap();
+
+        let cached = cached_image_path_for_url(&database, &root, &sanitized.storage_url)
+            .expect("redacted URL should resolve cached content");
+        assert_eq!(std::fs::read(cached).unwrap(), bytes);
         let _ = std::fs::remove_dir_all(root);
     }
 

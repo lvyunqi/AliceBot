@@ -50,6 +50,10 @@ pub struct ChatMessage {
     /// HTTPS image URLs that should be sent as multimodal content blocks.
     /// URLs are never included in Debug output or persisted in LLM audits.
     pub image_urls: Vec<String>,
+    /// Whether each image URL needs a temporary-media cache lookup. This is
+    /// kept parallel to `image_urls`; restored QQ media has a redacted URL and
+    /// can only be used when its local cache is available.
+    pub image_cache_required: Vec<bool>,
     /// Downloaded image payloads for temporary/signed media URLs.
     pub image_data: Vec<ImageData>,
     /// Native tool calls emitted by an assistant message.
@@ -75,6 +79,14 @@ impl fmt::Debug for ChatMessage {
             .field("role", &self.role)
             .field("content_chars", &self.content.chars().count())
             .field("image_count", &self.image_urls.len())
+            .field(
+                "image_cache_required_count",
+                &self
+                    .image_cache_required
+                    .iter()
+                    .filter(|required| **required)
+                    .count(),
+            )
             .field("image_data_count", &self.image_data.len())
             .field("tool_call_count", &self.tool_calls.len())
             .field("vision_required", &self.vision_required)
@@ -88,6 +100,7 @@ impl ChatMessage {
             role: Role::System,
             content: content.into(),
             image_urls: Vec::new(),
+            image_cache_required: Vec::new(),
             image_data: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -100,6 +113,7 @@ impl ChatMessage {
             role: Role::User,
             content: content.into(),
             image_urls: Vec::new(),
+            image_cache_required: Vec::new(),
             image_data: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -112,6 +126,7 @@ impl ChatMessage {
             role: Role::Assistant,
             content: content.into(),
             image_urls: Vec::new(),
+            image_cache_required: Vec::new(),
             image_data: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: None,
@@ -124,6 +139,7 @@ impl ChatMessage {
             role: Role::Assistant,
             content: String::new(),
             image_urls: Vec::new(),
+            image_cache_required: Vec::new(),
             image_data: Vec::new(),
             tool_calls,
             tool_call_id: None,
@@ -136,6 +152,7 @@ impl ChatMessage {
             role: Role::Tool,
             content: content.into(),
             image_urls: Vec::new(),
+            image_cache_required: Vec::new(),
             image_data: Vec::new(),
             tool_calls: Vec::new(),
             tool_call_id: Some(tool_call_id.into()),
@@ -148,6 +165,14 @@ impl ChatMessage {
             .into_iter()
             .filter(|url| url.starts_with("https://"))
             .take(4)
+            .collect();
+        self.image_cache_required = self
+            .image_urls
+            .iter()
+            .map(|url| {
+                crate::media::sanitize_remote_media_url(url, true)
+                    .is_some_and(|media| media.requires_cache)
+            })
             .collect();
         self
     }
@@ -172,6 +197,7 @@ impl ChatMessage {
 
     pub fn without_images(mut self) -> Self {
         self.image_urls.clear();
+        self.image_cache_required.clear();
         self.image_data.clear();
         self
     }
